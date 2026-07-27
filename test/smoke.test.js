@@ -15,8 +15,9 @@ const pharmacies = [
 async function startServer(options = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), "medroute-test-"));
   const port = 31000 + Math.floor(Math.random() * 1000);
+  const operatorToken = options.token ?? token;
   const server = spawn(process.execPath, ["server.js"], {
-    env: { ...process.env, PORT: String(port), MEDROUTE_DATA_DIR: dataDir, MEDROUTE_ACCESS_TOKEN: token, CALLE_API_KEY: options.live ? "test-key" : "", MEDROUTE_CALLE_CLIENT_MODULE: pathToFileURL(join(process.cwd(), "test", "mock-calle.js")).href, MEDROUTE_PYTHON: options.python || "python", ...(options.env || {}) },
+    env: { ...process.env, PORT: String(port), MEDROUTE_DATA_DIR: dataDir, MEDROUTE_ACCESS_TOKEN: operatorToken, CALLE_API_KEY: options.live ? "test-key" : "", MEDROUTE_CALLE_CLIENT_MODULE: pathToFileURL(join(process.cwd(), "test", "mock-calle.js")).href, MEDROUTE_PYTHON: options.python || "python", ...(options.env || {}) },
     stdio: ["ignore", "pipe", "pipe"]
   });
   await new Promise((resolve, reject) => {
@@ -24,7 +25,7 @@ async function startServer(options = {}) {
     server.stdout.on("data", chunk => { if (chunk.toString().includes("MedRoute running")) { clearTimeout(timer); resolve(); } });
     server.once("error", reject);
   });
-  const request = (path, init = {}) => fetch(`http://localhost:${port}${path}`, { ...init, headers: { Authorization: `Bearer ${token}`, ...(init.headers || {}) } });
+  const request = (path, init = {}) => fetch(`http://localhost:${port}${path}`, { ...init, headers: { Authorization: `Bearer ${operatorToken}`, ...(init.headers || {}) } });
   return { dataDir, port, request, async close() { server.kill(); await rm(dataDir, { recursive: true, force: true }); } };
 }
 
@@ -44,6 +45,14 @@ test("rejects unauthenticated API access and invalid check inputs", async () => 
     assert.equal(partlyInvalid.status, 400);
     const negativeDistance = await app.request("/api/check", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(checkBody({ pharmacies: [{ ...pharmacies[0], distanceKm: -1 }] })) });
     assert.equal(negativeDistance.status, 400);
+  } finally { await app.close(); }
+});
+
+test("documented judge token works only in safe local demo mode", async () => {
+  const app = await startServer({ token: "" });
+  try {
+    const response = await fetch(`http://localhost:${app.port}/api/history`, { headers: { Authorization: "Bearer medroute-demo" } });
+    assert.equal(response.status, 200);
   } finally { await app.close(); }
 });
 

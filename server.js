@@ -12,7 +12,9 @@ const publicDir = join(process.cwd(), "public");
 const dataDir = process.env.MEDROUTE_DATA_DIR || join(process.cwd(), "data");
 const historyFile = join(dataDir, "medroute-history.json");
 const transcriptPdfScript = join(process.cwd(), "scripts", "generate-transcript-pdf.py");
-const accessToken = process.env.MEDROUTE_ACCESS_TOKEN;
+const productionMode = process.env.MEDROUTE_ENV === "production";
+const accessToken = process.env.MEDROUTE_ACCESS_TOKEN || (!productionMode && !process.env.CALLE_API_KEY ? "medroute-demo" : undefined);
+if (!productionMode && process.env.CALLE_API_KEY && !process.env.MEDROUTE_ACCESS_TOKEN) throw new Error("Live CALL-E configuration requires MEDROUTE_ACCESS_TOKEN.");
 const idempotentRuns = new Map();
 const requestWindows = new Map();
 const localCooldownReservations = new Map();
@@ -23,7 +25,6 @@ const idempotencyPendingMs = Number(process.env.MEDROUTE_IDEMPOTENCY_PENDING_SEC
 const maxTranscriptTurns = Number(process.env.MEDROUTE_MAX_TRANSCRIPT_TURNS || 200);
 const readPermission = process.env.MEDROUTE_OIDC_READ_PERMISSION || "medroute.read";
 const livePermission = process.env.MEDROUTE_OIDC_LIVE_PERMISSION || "medroute.live";
-const productionMode = process.env.MEDROUTE_ENV === "production";
 if (productionMode && (!process.env.DATABASE_URL || !process.env.MEDROUTE_OIDC_ISSUER || !process.env.MEDROUTE_OIDC_AUDIENCE || !process.env.MEDROUTE_OIDC_JWKS_URL)) throw new Error("Production mode requires DATABASE_URL and MEDROUTE_OIDC_ISSUER, MEDROUTE_OIDC_AUDIENCE, and MEDROUTE_OIDC_JWKS_URL.");
 const ProductionStoreClass = productionMode && process.env.MEDROUTE_PRODUCTION_STORE_MODULE
   ? (await import(process.env.MEDROUTE_PRODUCTION_STORE_MODULE)).ProductionStore

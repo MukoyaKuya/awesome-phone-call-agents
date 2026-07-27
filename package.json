@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node --env-file-if-exists=.env server.js",
-    "dev": "node --env-file-if-exists=.env --watch server.js",
+    "start": "node --env-file-if-exists=.env --env-file-if-exists=.env.local server.js",
+    "dev": "node --env-file-if-exists=.env --env-file-if-exists=.env.local --watch server.js",
     "check": "node --check server.js",
     "test": "node --test test/*.test.js"
   },

@@ -1,9 +1,12 @@
 import html
 import io
 import json
+import os
 import re
 import sys
+import unicodedata
 
+import reportlab
 from reportlab.lib import colors
 from reportlab.lib.colors import HexColor
 from reportlab.lib.enums import TA_CENTER
@@ -11,11 +14,29 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.graphics.shapes import Drawing, Rect
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+FONT_DIR = os.path.join(os.path.dirname(reportlab.__file__), "fonts")
+pdfmetrics.registerFont(TTFont("MedRouteSans", os.path.join(FONT_DIR, "Vera.ttf")))
+pdfmetrics.registerFont(TTFont("MedRouteSans-Bold", os.path.join(FONT_DIR, "VeraBd.ttf")))
+
+
+def normalize_text(value):
+    value = unicodedata.normalize("NFC", str(value or ""))
+    if any(marker in value for marker in ("Ã", "Â", "â€")):
+        try:
+            repaired = value.encode("cp1252").decode("utf-8")
+            if sum(value.count(marker) for marker in ("Ã", "Â", "â€")) > sum(repaired.count(marker) for marker in ("Ã", "Â", "â€")):
+                value = repaired
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    return value.translate(str.maketrans({"–": "-", "—": "-", "‑": "-"}))
 
 
 def text(value):
-    return html.escape(str(value or "")).replace("\n", "<br/>")
+    return html.escape(normalize_text(value)).replace("\n", "<br/>")
 
 
 def timestamp(seconds):
@@ -30,7 +51,7 @@ def speaker_name(speaker):
 
 
 def clean_turn_text(value):
-    return re.sub(r"\s+", " ", re.sub(r"^\s*\d+\.\s+", "", str(value or ""))).strip()
+    return re.sub(r"\s+", " ", re.sub(r"^\s*\d+\.\s+", "", normalize_text(value))).strip()
 
 
 def sentence_complete(value):
@@ -57,7 +78,7 @@ def add_footer(canvas, document):
     canvas.setStrokeColor(HexColor("#DCE7F4"))
     canvas.line(18 * mm, 15 * mm, A4[0] - 18 * mm, 15 * mm)
     canvas.setFillColor(HexColor("#587093"))
-    canvas.setFont("Helvetica", 8)
+    canvas.setFont("MedRouteSans", 8)
     canvas.drawString(18 * mm, 10 * mm, "MedRoute - pharmacy availability transcript")
     canvas.drawRightString(A4[0] - 18 * mm, 10 * mm, f"Page {document.page}")
     canvas.restoreState()
@@ -87,7 +108,7 @@ def build_pdf(payload):
     title_style = ParagraphStyle(
         "TranscriptTitle",
         parent=styles["Heading1"],
-        fontName="Helvetica-Bold",
+        fontName="MedRouteSans-Bold",
         fontSize=22,
         leading=26,
         textColor=HexColor("#123F9A"),
@@ -96,7 +117,7 @@ def build_pdf(payload):
     label_style = ParagraphStyle(
         "Label",
         parent=styles["BodyText"],
-        fontName="Helvetica-Bold",
+        fontName="MedRouteSans-Bold",
         fontSize=8,
         leading=10,
         textColor=HexColor("#5A7294"),
@@ -105,7 +126,7 @@ def build_pdf(payload):
     value_style = ParagraphStyle(
         "Value",
         parent=styles["BodyText"],
-        fontName="Helvetica",
+        fontName="MedRouteSans",
         fontSize=10,
         leading=13,
         textColor=HexColor("#182A49"),
@@ -121,7 +142,7 @@ def build_pdf(payload):
 
     brand_lockup = Table([[
         medroute_logo(),
-        Paragraph("<b>MedRoute</b><br/><font color='#2F75D0' size='7'>CALL-E VOICE POWERED</font>", ParagraphStyle("BrandLockup", parent=value_style, fontSize=15, leading=16, textColor=HexColor("#102C62")))
+        Paragraph("<b>MedRoute</b><br/><font color='#2F75D0' size='7'>CALL-E VOICE POWERED</font>", ParagraphStyle("BrandLockup", parent=value_style, fontName="MedRouteSans", fontSize=15, leading=16, textColor=HexColor("#102C62")))
     ]], colWidths=[15 * mm, 65 * mm], hAlign="LEFT")
     brand_lockup.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -171,7 +192,7 @@ def build_pdf(payload):
         ]))
         story += [summary, Spacer(1, 8 * mm)]
 
-    story.append(Paragraph("Conversation", ParagraphStyle("ConversationHeading", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=15, leading=19, textColor=HexColor("#17376D"), spaceAfter=7)))
+    story.append(Paragraph("Conversation", ParagraphStyle("ConversationHeading", parent=styles["Heading2"], fontName="MedRouteSans-Bold", fontSize=15, leading=19, textColor=HexColor("#17376D"), spaceAfter=7)))
 
     for turn in merge_transcript_turns(payload.get("transcript", [])):
         is_agent = turn.get("speaker") == "bot"
@@ -196,5 +217,5 @@ def build_pdf(payload):
 
 
 if __name__ == "__main__":
-    payload = json.load(sys.stdin)
+    payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
     sys.stdout.buffer.write(build_pdf(payload))

@@ -22,7 +22,9 @@ npm start
 
 Open `http://localhost:3000`. By default the app is in **demo mode**, which produces deterministic mock call results and never contacts anyone.
 
-To run the app, configure both a valid server-side `CALLE_API_KEY` (only needed for live calls) and a long random `MEDROUTE_ACCESS_TOKEN` in `.env`. Enter the latter in the operator-token field; it is kept only in browser session storage and sent as a Bearer token for API requests. The server requires this token for all stored history and transcript access.
+For hackathon judging, the operator-token field is prefilled with `medroute-demo`. This documented token is accepted only in local development when `CALLE_API_KEY` is not configured, so judges can run the safe demo immediately after `npm start`. It cannot authorize live calls and is never accepted in production.
+
+To place live calls, configure both a valid server-side `CALLE_API_KEY` and a long random `MEDROUTE_ACCESS_TOKEN` in `.env` or `.env.local`. Enter the latter in the operator-token field; it is kept only in browser session storage and sent as a Bearer token for API requests. The server refuses to start with a live CALL-E key but no private operator token.
 
 Live calls are Kenya-only (`+254XXXXXXXXX`). The server requires both consent acknowledgements and a stable `Idempotency-Key` header before it will place a live call. The browser creates this key for each deliberate live submission; integrations must retain it when retrying the same request.
 
