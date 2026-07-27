@@ -36,7 +36,7 @@ function setLiveCallOverlay(active, pharmacyList = [], medicine = "") {
 document.querySelectorAll(".example-value").forEach(input => input.addEventListener("focus", () => { if (input.classList.contains("example-value")) { input.value = ""; input.classList.remove("example-value"); } }, { once: true }));
 
 function renderPharmacies() {
-  root.innerHTML = pharmacies.length ? pharmacies.map((p, i) => `<div class="pharmacy"><input aria-label="Pharmacy name" placeholder="Pharmacy name" value="${esc(p.name)}"><input aria-label="E.164 phone" placeholder="+254 700 000 000" value="${esc(p.phone)}"><input aria-label="Distance km" type="number" min="0" step="0.1" placeholder="km" value="${esc(p.distanceKm)}"><button aria-label="Remove pharmacy" data-remove="${i}">×</button></div>`).join("") : `<p class="empty-state">No pharmacies added yet. Add only contacts you are authorized to call.</p>`;
+  root.innerHTML = pharmacies.length ? pharmacies.map((p, i) => `<div class="pharmacy"><input aria-label="Pharmacy name" placeholder="Pharmacy name" value="${esc(p.name)}"><input aria-label="E.164 phone" placeholder="+12025550123" value="${esc(p.phone)}"><input aria-label="Distance km" type="number" min="0" step="0.1" placeholder="km" value="${esc(p.distanceKm)}"><button aria-label="Remove pharmacy" data-remove="${i}">×</button></div>`).join("") : `<p class="empty-state">No pharmacies added yet. Add only contacts you are authorized to call.</p>`;
 }
 
 function transcriptLink(record, resultIndex, result) {

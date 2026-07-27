@@ -39,12 +39,14 @@ test("rejects unauthenticated API access and invalid check inputs", async () => 
     assert.equal((await fetch(`http://localhost:${app.port}/api/history`)).status, 401);
     const missingConsent = await app.request("/api/check", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(checkBody({ consentAcknowledged: false })) });
     assert.equal(missingConsent.status, 400);
-    const badPhone = await app.request("/api/check", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(checkBody({ pharmacies: [{ name: "Outside Kenya", phone: "+15550101001" }] })) });
+    const badPhone = await app.request("/api/check", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(checkBody({ pharmacies: [{ name: "Invalid number", phone: "0700000001" }] })) });
     assert.equal(badPhone.status, 400);
-    const partlyInvalid = await app.request("/api/check", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(checkBody({ pharmacies: [...pharmacies, { name: "Invalid", phone: "+15550101001" }] })) });
+    const partlyInvalid = await app.request("/api/check", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(checkBody({ pharmacies: [...pharmacies, { name: "Invalid", phone: "+0123" }] })) });
     assert.equal(partlyInvalid.status, 400);
     const negativeDistance = await app.request("/api/check", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(checkBody({ pharmacies: [{ ...pharmacies[0], distanceKm: -1 }] })) });
     assert.equal(negativeDistance.status, 400);
+    const international = await app.request("/api/check", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(checkBody({ pharmacies: [{ name: "International Demo", phone: "+12025550123", distanceKm: 2 }] })) });
+    assert.equal(international.status, 200);
   } finally { await app.close(); }
 });
 

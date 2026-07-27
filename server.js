@@ -264,9 +264,12 @@ QUESTION RULES:
 5. Once those four items are answered or marked unknown, say "Thank you for your help. Goodbye." and end the call. Do not restart the conversation or repeat the medicine name.
 
 SAFETY: Identify yourself as an automated assistant. Do not share patient information, request prescriptions, make a purchase, place an order, reserve medicine, give medical advice, or infer facts the pharmacy did not state. Return only facts stated by ${pharmacy.name}.`;
+  const outboundRecipient = { phone: pharmacy.phone };
+  if (process.env.MEDROUTE_CALL_LOCALE) outboundRecipient.locale = process.env.MEDROUTE_CALL_LOCALE;
+  if (process.env.MEDROUTE_CALL_REGION) outboundRecipient.region = process.env.MEDROUTE_CALL_REGION;
   const call = await client.calls.createAndWait({
     task,
-    recipient: { phone: pharmacy.phone, locale: "en-KE", region: "KE" },
+    recipient: outboundRecipient,
     resultSchema,
     recipientResultSchema: resultSchema,
     metadata: { workflow: "medroute-pharmacy-availability" }
@@ -334,7 +337,7 @@ const server = createServer(async (req, res) => {
       const pharmacies = Array.isArray(body.pharmacies) ? body.pharmacies.slice(0, 5) : [];
       if (!medicine || pharmacies.length === 0) return json(res, 400, { error: "Medicine and at least one pharmacy are required." });
       const clean = pharmacies.map(p => ({ name: safeText(p.name), phone: safeText(p.phone, 24), distanceKm: p.distanceKm === "" || p.distanceKm == null ? 0 : Number(p.distanceKm) }));
-      if (clean.some(p => !p.name || !/^\+254\d{9}$/.test(p.phone))) return json(res, 400, { error: "Every pharmacy must have a name and an authorized Kenyan phone number in +254XXXXXXXXX format." });
+      if (clean.some(p => !p.name || !/^\+[1-9]\d{7,14}$/.test(p.phone))) return json(res, 400, { error: "Every pharmacy must have a name and an authorized phone number in international E.164 format, such as +12025550123." });
       if (clean.some(p => !Number.isFinite(p.distanceKm) || p.distanceKm < 0)) return json(res, 400, { error: "Pharmacy distance must be a non-negative number." });
       if (body.consentAcknowledged !== true) return json(res, 400, { error: "Confirm authorization to contact every pharmacy before running a check." });
       const liveRequested = body.confirmLive === true;

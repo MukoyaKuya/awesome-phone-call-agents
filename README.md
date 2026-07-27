@@ -26,7 +26,7 @@ For hackathon judging, the operator-token field is prefilled with `medroute-demo
 
 To place live calls, configure both a valid server-side `CALLE_API_KEY` and a long random `MEDROUTE_ACCESS_TOKEN` in `.env` or `.env.local`. Enter the latter in the operator-token field; it is kept only in browser session storage and sent as a Bearer token for API requests. The server refuses to start with a live CALL-E key but no private operator token.
 
-Live calls are Kenya-only (`+254XXXXXXXXX`). The server requires both consent acknowledgements and a stable `Idempotency-Key` header before it will place a live call. The browser creates this key for each deliberate live submission; integrations must retain it when retrying the same request.
+Recipients may be in any CALL-E-supported country and must use international E.164 format, such as `+12025550123` or `+254700000001`. By default CALL-E infers routing from the number; deployments may set `MEDROUTE_CALL_LOCALE` and `MEDROUTE_CALL_REGION` when explicit hints are required. The server requires both consent acknowledgements and a stable `Idempotency-Key` header before it will place a live call. The browser creates this key for each deliberate live submission; integrations must retain it when retrying the same request.
 
 The default production safeguards allow 30 checks per minute per operator/IP, enforce a 15-minute per-pharmacy live-call cooldown, and allow crashed idempotency reservations to be retried after 15 minutes. Configure `MEDROUTE_MAX_CHECKS_PER_MINUTE`, `MEDROUTE_LIVE_COOLDOWN_SECONDS`, `MEDROUTE_IDEMPOTENCY_PENDING_SECONDS`, `MEDROUTE_MAX_TRANSCRIPT_TURNS`, and a stable `MEDROUTE_RECIPIENT_HASH_KEY` for the deployment. Idempotency records are persisted with local history, but a multi-instance deployment should use the PostgreSQL/OIDC production mode for transactional cooldown reservations, managed identity, and audit logging.
 
@@ -40,10 +40,10 @@ Completed live calls preserve CALL-E's returned transcript turns alongside the r
 
 ## Safety and privacy
 
-- Use only authorized Kenyan pharmacy phone numbers in `+254XXXXXXXXX` format.
+- Use only authorized pharmacy phone numbers in international E.164 format.
 - Do not enter patient names, diagnoses, prescription identifiers, payment data, or other personal health information.
 - No ordering, holding, payment, or clinical recommendation is permitted.
-- Demo numbers are fictional and formatted only to exercise the validation path.
+- Demo numbers are fictional international examples formatted only to exercise the validation path.
 - Keep credentials server-side; `.env` is ignored by Git. Phone numbers are masked in responses, saved history, and transcript PDFs.
 
 ## Demo script (3 minutes)
