@@ -1,9 +1,11 @@
-import pg from "pg";
-
 export class ProductionStore {
-  constructor(connectionString) { this.pool = new pg.Pool({ connectionString }); }
+  constructor(connectionString, pool = null) { this.connectionString = connectionString; this.pool = pool; }
 
   async init() {
+    if (!this.pool) {
+      const { default: pg } = await import("pg");
+      this.pool = new pg.Pool({ connectionString: this.connectionString });
+    }
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS medroute_runs (id TEXT PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL, payload JSONB NOT NULL);
       CREATE TABLE IF NOT EXISTS medroute_idempotency (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, status TEXT NOT NULL, record_id TEXT REFERENCES medroute_runs(id), created_at TIMESTAMPTZ NOT NULL DEFAULT now());
@@ -37,6 +39,8 @@ export class ProductionStore {
   }
 
   async releaseIdempotency(key) { await this.pool.query("DELETE FROM medroute_idempotency WHERE key = $1 AND status = 'pending'", [key]); }
+
+  async markIdempotencyUnknown(key) { await this.pool.query("UPDATE medroute_idempotency SET status = 'unknown' WHERE key = $1 AND status = 'pending'", [key]); }
 
   async saveRun(record, actor) {
     const client = await this.pool.connect();

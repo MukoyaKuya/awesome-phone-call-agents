@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { ProductionStore } from "./production-store.js";
+import { actorFromClaims, hasPermission } from "./authorization.js";
 import { extname, join, normalize, relative } from "node:path";
 
 const port = Number(process.env.PORT || 3000);
@@ -20,9 +21,14 @@ const maxChecksPerMinute = Number(process.env.MEDROUTE_MAX_CHECKS_PER_MINUTE || 
 const liveCooldownMs = Number(process.env.MEDROUTE_LIVE_COOLDOWN_SECONDS || 900) * 1_000;
 const idempotencyPendingMs = Number(process.env.MEDROUTE_IDEMPOTENCY_PENDING_SECONDS || 900) * 1_000;
 const maxTranscriptTurns = Number(process.env.MEDROUTE_MAX_TRANSCRIPT_TURNS || 200);
+const readPermission = process.env.MEDROUTE_OIDC_READ_PERMISSION || "medroute.read";
+const livePermission = process.env.MEDROUTE_OIDC_LIVE_PERMISSION || "medroute.live";
 const productionMode = process.env.MEDROUTE_ENV === "production";
 if (productionMode && (!process.env.DATABASE_URL || !process.env.MEDROUTE_OIDC_ISSUER || !process.env.MEDROUTE_OIDC_AUDIENCE || !process.env.MEDROUTE_OIDC_JWKS_URL)) throw new Error("Production mode requires DATABASE_URL and MEDROUTE_OIDC_ISSUER, MEDROUTE_OIDC_AUDIENCE, and MEDROUTE_OIDC_JWKS_URL.");
-const productionStore = productionMode ? new ProductionStore(process.env.DATABASE_URL) : null;
+const ProductionStoreClass = productionMode && process.env.MEDROUTE_PRODUCTION_STORE_MODULE
+  ? (await import(process.env.MEDROUTE_PRODUCTION_STORE_MODULE)).ProductionStore
+  : ProductionStore;
+const productionStore = productionMode ? new ProductionStoreClass(process.env.DATABASE_URL) : null;
 if (productionStore) await productionStore.init();
 const oidcJwks = productionMode ? createRemoteJWKSet(new URL(process.env.MEDROUTE_OIDC_JWKS_URL)) : null;
 
@@ -70,10 +76,6 @@ function redactPhoneNumbers(value) {
 
 function phoneKey(phone) { return createHmac("sha256", process.env.MEDROUTE_RECIPIENT_HASH_KEY || accessToken || "local-development-key").update(phone).digest("hex"); }
 
-function actorKey(subject) {
-  return createHash("sha256").update(`${process.env.MEDROUTE_OIDC_ISSUER || "local"}\0${subject}`).digest("hex");
-}
-
 function requestFingerprint({ medicine, strength, pharmacies }) {
   return createHash("sha256").update(JSON.stringify({ medicine, strength, pharmacies: pharmacies.map(p => ({ name: p.name, phone: phoneKey(p.phone), distanceKm: p.distanceKm })) })).digest("hex");
 }
@@ -97,12 +99,13 @@ async function authenticate(req) {
     if (typeof supplied !== "string" || !supplied.startsWith("Bearer ")) return null;
     try {
       const verified = await jwtVerify(supplied.slice(7), oidcJwks, { issuer: process.env.MEDROUTE_OIDC_ISSUER, audience: process.env.MEDROUTE_OIDC_AUDIENCE });
-      if (typeof verified.payload.sub !== "string" || !verified.payload.sub) return null;
-      return { subject: actorKey(verified.payload.sub) };
+      return actorFromClaims(verified.payload, process.env.MEDROUTE_OIDC_ISSUER);
     } catch { return null; }
   }
   const expected = `Bearer ${accessToken || ""}`;
-  return Boolean(accessToken) && typeof supplied === "string" && supplied.length === expected.length && timingSafeEqual(Buffer.from(supplied), Buffer.from(expected)) ? { subject: actorKey("local-operator") } : null;
+  return Boolean(accessToken) && typeof supplied === "string" && supplied.length === expected.length && timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))
+    ? { subject: createHash("sha256").update("local\0local-operator").digest("hex"), permissions: new Set([readPermission, livePermission]) }
+    : null;
 }
 
 function withinRateLimit(req, actor) {
@@ -282,6 +285,9 @@ const server = createServer(async (req, res) => {
   res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'");
   const actor = (req.url || "").startsWith("/api/") ? await authenticate(req) : null;
   if ((req.url || "").startsWith("/api/") && !actor) return json(res, 401, { error: "Operator authentication is required." });
+  const readRequest = req.method === "GET" && ["/api/history", "/api/analytics"].includes((req.url || "").split("?")[0]);
+  const transcriptPath = (req.url || "").split("?")[0].startsWith("/api/transcripts/");
+  if (productionMode && (readRequest || transcriptPath) && !hasPermission(actor, readPermission)) return json(res, 403, { error: `The ${readPermission} permission is required.` });
   if (req.method === "GET" && req.url === "/api/history") {
     try { return json(res, 200, { history: (await readHistory(actor.subject)).map(publicRecord) }); }
     catch (error) { return json(res, 500, { error: error.message || "Could not read saved history." }); }
@@ -332,6 +338,7 @@ const server = createServer(async (req, res) => {
       if (body.consentAcknowledged !== true) return json(res, 400, { error: "Confirm authorization to contact every pharmacy before running a check." });
       const liveRequested = body.confirmLive === true;
       if (liveRequested && body.liveCallAcknowledged !== true) return json(res, 400, { error: "Explicit live-call authorization is required." });
+      if (productionMode && liveRequested && !hasPermission(actor, livePermission)) return json(res, 403, { error: `The ${livePermission} permission is required for live calls.` });
       const live = Boolean(process.env.CALLE_API_KEY && liveRequested);
       const idempotencyKey = safeText(req.headers["idempotency-key"], 120);
       if (live && !/^[A-Za-z0-9_-]{16,120}$/.test(idempotencyKey)) return json(res, 400, { error: "A stable Idempotency-Key header is required for live calls." });
@@ -342,10 +349,12 @@ const server = createServer(async (req, res) => {
         const existing = idempotentRuns.get(idempotencyMapKey);
         if (existing) {
           if (existing.fingerprint !== fingerprint) return json(res, 409, { error: "This Idempotency-Key belongs to a different request." });
+          if (existing.uncertain) return json(res, 409, { error: "This live request has an unknown outcome and requires administrator reconciliation before it can be retried." });
           return json(res, 200, publicRecord(await existing.promise));
         }
       }
       const execute = async () => {
+        if (live) sideEffectsStarted = true;
         const calls = live
           ? await Promise.allSettled(clean.map(p => runLiveCall(p, medicine, strength)))
           : clean.map(p => ({ status: "fulfilled", value: demoResult(p, medicine) }));
@@ -353,16 +362,21 @@ const server = createServer(async (req, res) => {
           .sort((a, b) => score(b) - score(a));
         const record = { id: `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, createdAt: new Date().toISOString(), mode: live ? "live" : "demo", medicine, strength, results, ...(live ? { idempotencyKey: storedIdempotencyKey, requestFingerprint: fingerprint } : {}) };
         await saveHistory(record, actor.subject);
-        if (productionStore) await productionStore.audit(actor.subject, live ? "live_check_completed" : "demo_check_completed", { runId: record.id, pharmacyCount: clean.length });
+        if (productionStore) {
+          try { await productionStore.audit(actor.subject, live ? "live_check_completed" : "demo_check_completed", { runId: record.id, pharmacyCount: clean.length }); }
+          catch (error) { console.error("MedRoute audit write failed after the run was saved:", error.message); }
+        }
         return record;
       };
       if (!live) return json(res, 200, await execute());
+      let sideEffectsStarted = false;
       const pending = Promise.resolve().then(async () => {
         if (productionStore) {
           const reservation = await productionStore.reserveIdempotency(storedIdempotencyKey, fingerprint, new Date(Date.now() - idempotencyPendingMs));
           if (!reservation.created) {
             if (reservation.fingerprint !== fingerprint) throw Object.assign(new Error("This Idempotency-Key belongs to a different request."), { status: 409 });
             if (reservation.record) return reservation.record;
+            if (reservation.status === "unknown") throw Object.assign(new Error("This live request has an unknown outcome and requires administrator reconciliation before it can be retried."), { status: 409 });
             throw Object.assign(new Error("This live request is already in progress. Retry with the same key shortly."), { status: 409 });
           }
         } else {
@@ -387,9 +401,23 @@ const server = createServer(async (req, res) => {
         if (!cooldownReserved) throw Object.assign(new Error("A selected pharmacy was contacted recently. Wait for the live-call cooldown before trying again."), { status: 429 });
         return execute();
       });
-      idempotentRuns.set(idempotencyMapKey, { fingerprint, promise: pending });
+      const idempotencyEntry = { fingerprint, promise: pending, uncertain: false };
+      idempotentRuns.set(idempotencyMapKey, idempotencyEntry);
       try { json(res, 200, publicRecord(await pending)); }
-      catch (error) { idempotentRuns.delete(idempotencyMapKey); if (productionStore) await productionStore.releaseIdempotency(storedIdempotencyKey); await productionStore?.audit(actor.subject, "live_check_failed", { status: error.status || 500 }); return json(res, error.status || 500, { error: error.message || "Unexpected server error" }); }
+      catch (error) {
+        if (sideEffectsStarted) {
+          idempotencyEntry.uncertain = true;
+          if (productionStore) {
+            try { await productionStore.markIdempotencyUnknown(storedIdempotencyKey); } catch (stateError) { console.error("Could not persist unknown idempotency state:", stateError.message); }
+            try { await productionStore.audit(actor.subject, "live_check_outcome_unknown", { status: error.status || 500 }); } catch (auditError) { console.error("Could not audit unknown live-call outcome:", auditError.message); }
+          }
+          return json(res, 500, { error: "The live call may have completed, but its result could not be persisted. The idempotency key is locked and requires administrator reconciliation; do not retry with a new key." });
+        }
+        idempotentRuns.delete(idempotencyMapKey);
+        if (productionStore) await productionStore.releaseIdempotency(storedIdempotencyKey);
+        await productionStore?.audit(actor.subject, "live_check_failed", { status: error.status || 500 });
+        return json(res, error.status || 500, { error: error.message || "Unexpected server error" });
+      }
     } catch (error) { json(res, 500, { error: error.message || "Unexpected server error" }); }
     return;
   }
