@@ -39,7 +39,7 @@ const resultSchema = {
   properties: {
     stock_status: { type: "string", enum: ["in_stock", "limited", "out_of_stock", "unknown"] },
     price_range: { type: "string" },
-    pickup_readiness: { type: "string", enum: ["can_hold", "cannot_hold", "unknown"] },
+    pickup_readiness: { type: "string", enum: ["ready_today", "not_confirmed_today", "unknown"] },
     hours: { type: "string" },
     substitution_available: { type: "string" },
     notes: { type: "string" },
@@ -83,10 +83,11 @@ function requestFingerprint({ medicine, strength, pharmacies }) {
 
 function sanitizeResult(result) {
   const source = result && typeof result === "object" ? result : {};
+  const pickupReadiness = { can_hold: "ready_today", cannot_hold: "not_confirmed_today" }[source.pickup_readiness] || source.pickup_readiness;
   return {
     stock_status: ["in_stock", "limited", "out_of_stock", "unknown"].includes(source.stock_status) ? source.stock_status : "unknown",
     price_range: redactPhoneNumbers(source.price_range),
-    pickup_readiness: ["can_hold", "cannot_hold", "unknown"].includes(source.pickup_readiness) ? source.pickup_readiness : "unknown",
+    pickup_readiness: ["ready_today", "not_confirmed_today", "unknown"].includes(pickupReadiness) ? pickupReadiness : "unknown",
     hours: redactPhoneNumbers(source.hours),
     substitution_available: redactPhoneNumbers(source.substitution_available),
     notes: redactPhoneNumbers(source.notes),
@@ -127,8 +128,8 @@ function demoResult(pharmacy, medicine) {
     distanceKm: pharmacy.distanceKm,
     result: {
       stock_status: status,
-      price_range: status === "out_of_stock" ? "Not available" : "KES 850–1,150",
-      pickup_readiness: status === "in_stock" ? "can_hold" : "cannot_hold",
+      price_range: status === "out_of_stock" ? "Not available" : "KES 2,400–3,100",
+      pickup_readiness: status === "in_stock" ? "ready_today" : "not_confirmed_today",
       hours: "Open until 8:00 PM",
       substitution_available: status === "out_of_stock" ? "Ask pharmacist" : "Not needed",
       notes: `Demo response for ${medicine}. Verify with a live authorized call.`,
@@ -141,7 +142,7 @@ function demoResult(pharmacy, medicine) {
 function score(item) {
   const r = item.result || {};
   return (r.stock_status === "in_stock" ? 100 : r.stock_status === "limited" ? 55 : 0)
-    + (r.pickup_readiness === "can_hold" ? 20 : 0) - Number(item.distanceKm || 0) * 2;
+    + (["ready_today", "can_hold"].includes(r.pickup_readiness) ? 20 : 0) - Number(item.distanceKm || 0) * 2;
 }
 
 async function readHistory(actor) {
@@ -254,7 +255,7 @@ IDENTITY CHECK:
 - If the answer is unclear, ask exactly once: "May I confirm, is this ${pharmacy.name}?" Then wait.
 - If they do not confirm after that, say "Thank you. I may have reached the wrong number. Goodbye." and end the call. Do not ask any availability questions.
 
-AFTER CONFIRMATION: Say exactly: "On behalf of our customer, we're requesting an availability check for medicine." Then ask: "Is ${medicineRequest} available today?"
+AFTER CONFIRMATION: Say exactly: "On behalf of a care coordinator, we're requesting a time-sensitive medicine availability check." Then ask: "Is ${medicineRequest} available today?"
 
 QUESTION RULES:
 1. Listen completely to each answer before speaking again.

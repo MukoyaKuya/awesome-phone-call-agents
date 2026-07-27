@@ -1,3 +1,7 @@
+const defaultDemoPharmacies = [
+  { name: "Harbor Health Pharmacy", phone: "+12025550123", distanceKm: "2.4" },
+  { name: "Riverside Care Pharmacy", phone: "+12025550124", distanceKm: "5.1" }
+];
 let pharmacies = loadSavedPharmacies();
 let history = [];
 const root = document.querySelector("#pharmacies");
@@ -9,7 +13,9 @@ accessTokenInput.addEventListener("input", () => sessionStorage.setItem("medrout
 const esc = value => String(value ?? "").replace(/[&<>"]/g, char => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" })[char]);
 function loadSavedPharmacies() {
   try {
-    const saved = JSON.parse(localStorage.getItem("medroute-authorized-pharmacies") || "[]");
+    const stored = localStorage.getItem("medroute-authorized-pharmacies");
+    if (stored === null) return defaultDemoPharmacies.map(pharmacy => ({ ...pharmacy }));
+    const saved = JSON.parse(stored);
     return Array.isArray(saved) ? saved.slice(0, 5).map(pharmacy => ({ name: String(pharmacy.name || ""), phone: String(pharmacy.phone || ""), distanceKm: String(pharmacy.distanceKm || "") })) : [];
   } catch { return []; }
 }
@@ -45,7 +51,7 @@ function transcriptLink(record, resultIndex, result) {
 }
 
 function resultCards(record) {
-  return record.results.map((x, i) => { const r = x.result || {}; return `<article class="result ${esc(r.stock_status || "unknown")}"><div class="rank">${String(i + 1).padStart(2, "0")}</div><div><h3>${esc(x.pharmacy)}</h3><p>${esc(x.distanceKm)} km away · ${esc(x.phone)}</p></div><strong>${esc((r.stock_status || "unavailable").replaceAll("_", " "))}</strong><dl><div><dt>Price</dt><dd>${esc(r.price_range || "Unknown")}</dd></div><div><dt>Pickup</dt><dd>${esc((r.pickup_readiness || "unknown").replaceAll("_", " "))}</dd></div><div><dt>Hours</dt><dd>${esc(r.hours || "Unknown")}</dd></div></dl><p class="note">${esc(r.notes || x.error || "No details returned.")}</p>${transcriptLink(record, i, x)}</article>`; }).join("");
+  return record.results.map((x, i) => { const r = x.result || {}; const pickup = { can_hold: "ready for pickup today", cannot_hold: "not confirmed today", ready_today: "ready for pickup today", not_confirmed_today: "not confirmed today", unknown: "unknown" }[r.pickup_readiness] || String(r.pickup_readiness || "unknown").replaceAll("_", " "); return `<article class="result ${esc(r.stock_status || "unknown")}"><div class="rank">${String(i + 1).padStart(2, "0")}</div><div><h3>${esc(x.pharmacy)}</h3><p>${esc(x.distanceKm)} km away · ${esc(x.phone)}</p></div><strong>${esc((r.stock_status || "unavailable").replaceAll("_", " "))}</strong><dl><div><dt>Price</dt><dd>${esc(r.price_range || "Unknown")}</dd></div><div><dt>Pickup today</dt><dd>${esc(pickup)}</dd></div><div><dt>Hours</dt><dd>${esc(r.hours || "Unknown")}</dd></div></dl><p class="note">${esc(r.notes || x.error || "No details returned.")}</p>${transcriptLink(record, i, x)}</article>`; }).join("");
 }
 
 function show(record, scroll = true) {

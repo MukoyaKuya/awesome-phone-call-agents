@@ -81,6 +81,7 @@ test("live calls require both consents and return ranked partial failures idempo
     assert.equal(one.id, two.id);
     assert.equal(one.results.length, 2);
     assert.equal(one.results.filter(result => result.error).length, 1);
+    assert.equal(one.results.find(result => result.result)?.result.pickup_readiness, "ready_today");
     assert.equal((await (await app.request("/api/history")).json()).history.length, 1);
     const mismatched = await app.request("/api/check", { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": "stable-live-key-123" }, body: JSON.stringify(checkBody({ medicine: "Different medicine", confirmLive: true, liveCallAcknowledged: true })) });
     assert.equal(mismatched.status, 409);

@@ -1,12 +1,14 @@
 # MedRoute — CALL-E Hackathon Entry
 
-MedRoute turns a frustrating phone-bound task into a safe, structured workflow: with the user's authorization, it calls selected pharmacies to check a medicine's availability, approximate price, pickup readiness, and closing time—then ranks the responses into a clear shortlist.
+MedRoute turns a time-sensitive, phone-bound task into a safe, structured workflow: with an operator's authorization, it calls selected pharmacies to check a medicine's availability, approximate price, same-day pickup readiness, and closing time—then ranks the responses into a clear shortlist for a caregiver or care coordinator.
 
 It deliberately does **not** provide medical advice, share patient details, place orders, or reserve medication. A licensed clinician or pharmacist remains responsible for medicine suitability.
 
 ## Why this matters
 
-For time-sensitive medicine, online inventories are frequently incomplete and a patient or caregiver may spend hours calling pharmacies one by one. MedRoute gives care coordinators, family caregivers, and community-health organizations a consent-first way to gather the same facts in parallel.
+After a discharge, an unexpected stockout, or a search for a less commonly stocked strength or formulation, a caregiver may need an answer promptly. Pharmacy inventory may be unavailable online or may still require physical confirmation. MedRoute gives care coordinators, family caregivers, and community-health organizations a consent-first way to gather the same factual answers in parallel instead of repeating the same call.
+
+The focused use case is availability coordination—not ordinary price shopping. The included scenario uses an illustrative medicine and fictional contacts to show how a coordinator can create a comparable pickup shortlist without disclosing who needs the medicine.
 
 ## CALL-E integration
 
@@ -20,7 +22,7 @@ python -m pip install -r requirements.txt
 npm start
 ```
 
-Open `http://localhost:3000`. By default the app is in **demo mode**, which produces deterministic mock call results and never contacts anyone.
+Open `http://localhost:3000`. By default the app is in **demo mode**, which produces deterministic mock call results and never contacts anyone. A fresh browser is seeded with two clearly fictional demonstration pharmacies so the safe workflow can be tested immediately; replace them before enabling live calls.
 
 For hackathon judging, the operator-token field is prefilled with `medroute-demo`. This documented token is accepted only in local development when `CALLE_API_KEY` is not configured, so judges can run the safe demo immediately after `npm start`. It cannot authorize live calls and is never accepted in production.
 
@@ -46,17 +48,21 @@ Completed live calls preserve CALL-E's returned transcript turns alongside the r
 - Demo numbers are fictional international examples formatted only to exercise the validation path.
 - Keep credentials server-side; `.env` is ignored by Git. Phone numbers are masked in responses, saved history, and transcript PDFs.
 
-## Demo script (3 minutes)
+## Demo script (under 3 minutes)
 
-1. Introduce the real bottleneck: caregivers calling pharmacies one at a time.
-2. Enter a medicine and show the explicit authorization gate.
+1. Introduce the specific bottleneck: after a discharge or unexpected stockout, a caregiver or coordinator needs to locate a particular medicine promptly.
+2. Show the illustrative medicine, fictional pharmacy shortlist, and explicit authorization gate.
 3. Run the safe demo and compare the ranked, schema-shaped results.
-4. Show `server.js` and explain the real CALL-E `createAndWait` call plus result schema.
+4. Show or describe an authorized CALL-E call and the real `createAndWait` result schema.
 5. Close on boundaries: no medical advice, no PHI, no purchase, always transparent and consent-based.
+
+## Future extension
+
+The same “call a shortlist, verify facts, return structured evidence” pattern could support inventory exception workflows for hospital networks and public-health supply chains—for example, confirming near-expiry stock before a human-approved redistribution. That is a future application, not a claim of the current pharmacy-availability MVP.
 
 ## Submission checklist
 
 - [ ] Replace demo pharmacies with authorized test recipients for the recorded live-call segment.
-- [ ] Record and publish a ~3-minute demo video.
+- [ ] Record and publish a demo video shorter than three minutes; target 2:40–2:50.
 - [ ] Add this app under `apps/typescript/medroute/` in a fork of `CALLE-AI/awesome-phone-call-agents` and open a PR.
 - [ ] Add the PR URL, video, and CALL-E account email to Devpost.

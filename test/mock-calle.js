@@ -5,7 +5,7 @@ export class CalleClient {
     return {
       id: `call_${recipient.phone.slice(-4)}`,
       recipients: [{
-        structuredResult: { stock_status: "in_stock", price_range: "KES 850", pickup_readiness: "unknown", hours: "Open until 8 PM", confidence: "high" },
+        structuredResult: { stock_status: "in_stock", price_range: "KES 2,400", pickup_readiness: "ready_today", hours: "Open until 8 PM", confidence: "high" },
         summary: "Available today.",
         attempts: [{ transcriptTurns: [{ speaker: "bot", text: "Hello." }] }]
       }]

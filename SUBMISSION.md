@@ -2,17 +2,17 @@
 
 ## Devpost title
 
-MedRoute — Find medicine, faster
+MedRoute — Time-sensitive medicine availability, handled
 
 ## One-line pitch
 
-MedRoute uses CALL-E to turn pharmacy availability checks into a consent-first, structured calling workflow for caregivers and care coordinators.
+MedRoute uses CALL-E to help caregivers and care coordinators locate time-sensitive or hard-to-find medicine through consent-first, structured pharmacy calls.
 
 ## Devpost description
 
-Finding a prescribed medicine can still mean calling several pharmacies one by one—especially when online inventory is missing or stale. That delay is hard on caregivers and care teams, and it produces no useful record of what was checked.
+After a hospital discharge, an unexpected stockout, or a search for a less commonly stocked strength or formulation, locating a prescribed medicine can still mean calling pharmacies one by one. Online inventory may be unavailable, stale, or require physical confirmation. The repeated calls consume a caregiver's or coordinator's time and produce no comparable record of what was checked.
 
-MedRoute lets an operator enter a medicine and a small list of pharmacies they are authorized to contact. After an explicit authorization gate, CALL-E calls each pharmacy, identifies itself as an automated assistant, asks only for stock status, approximate price range, pickup readiness, and hours, then returns schema-validated results. MedRoute ranks the responses into a shortlist the operator can act on.
+MedRoute lets an operator enter a medicine and a small list of pharmacies they are authorized to contact. After an explicit authorization gate, CALL-E calls each pharmacy, identifies itself as an automated assistant, asks only for stock status, approximate price range, same-day pickup readiness, and hours, then returns schema-validated results. MedRoute ranks the responses into a shortlist the operator can act on.
 
 The design is deliberately bounded. It never enters patient details, offers medical advice, asks for a prescription, makes a purchase, or holds medication. Demo mode returns deterministic data and never places calls; a second, clearly labelled confirmation is required before the server-side CALL-E code path can run.
 
@@ -20,6 +20,7 @@ Built with the official `@call-e/calle` server SDK. The live workflow uses `Call
 
 ## What is novel
 
+- It targets a specific phone-work bottleneck: promptly confirming physical availability when an online listing is absent or insufficient.
 - It treats the call result as operational data, not an unstructured transcript: each pharmacy response is normalized and ranked.
 - It makes safety visible in the interaction: authorization, demo-first behavior, and a separate live-call decision.
 - It creates a reusable pattern for any “call a shortlist, compare factual answers, let a human decide” workflow.
@@ -28,22 +29,22 @@ Built with the official `@call-e/calle` server SDK. The live workflow uses `Call
 
 | Criterion | Evidence |
 | --- | --- |
-| Real-world impact | Removes a repeated, time-sensitive coordination burden for caregivers and care teams. |
+| Real-world impact | Removes a repeated coordination burden when a caregiver or care team needs a particular medicine promptly. |
 | Quality of idea | A focused, bounded calling workflow rather than a generic voice agent. |
 | Technical implementation | Official CALL-E SDK, real `createAndWait` integration, explicit recipients, JSON result schema, metadata, and automated demo smoke test. |
 | Product and demo | A polished result-ranked interface, visible safeguards, deterministic demo mode, and a live-call path for authorized recipients. |
 
-## Three-minute video run of show
+## Video run of show (target: 2:45)
 
 | Time | Show | Say |
 | --- | --- | --- |
-| 0:00–0:20 | Opening screen | “Finding medication often still means a caregiver making a string of repetitive calls.” |
-| 0:20–0:45 | Medicine and pharmacy form | “MedRoute turns that into one transparent, authorized workflow—without patient details or medical advice.” |
-| 0:45–1:15 | Consent gate and demo mode | “Calls are never hidden: demo mode is the default and live calls require a distinct confirmation.” |
-| 1:15–1:45 | Results shortlist | “CALL-E returns comparable stock, price, pickup, and hours data. MedRoute ranks the practical options.” |
-| 1:45–2:25 | `runLiveCall` in `server.js` | “This is a real CALL-E `createAndWait` workflow with an explicit recipient and structured result schema.” |
-| 2:25–2:50 | Authorized live call or recorded result | “With authorized recipients, the exact same path calls a pharmacy, identifies itself, and returns only factual results.” |
-| 2:50–3:00 | Closing screen | “MedRoute helps humans decide faster; it never diagnoses, orders, or substitutes clinical judgment.” |
+| 0:00–0:20 | Opening screen | “After a discharge or unexpected stockout, a caregiver may need a particular medicine today—but confirming physical stock can mean repeating the same call.” |
+| 0:20–0:45 | Illustrative medicine and pharmacy form | “MedRoute turns that narrow task into one transparent workflow without patient details or medical advice.” |
+| 0:45–1:10 | Authorization gate and demo mode | “The operator confirms authorization. Demo mode is safe by default; live calls require a second explicit decision.” |
+| 1:10–1:40 | Results shortlist | “CALL-E returns comparable stock, price, same-day pickup, and hours data. MedRoute ranks practical options.” |
+| 1:40–2:15 | Authorized live call and result | “The production path calls an authorized recipient, identifies itself, asks each question once, and returns a structured result.” |
+| 2:15–2:35 | Transcript and saved check | “The call becomes auditable evidence rather than a forgotten conversation.” |
+| 2:35–2:45 | Closing screen | “MedRoute helps humans decide faster; it never diagnoses, orders, or substitutes clinical judgment.” |
 
 ## Live demo checklist
 
@@ -53,6 +54,10 @@ Built with the official `@call-e/calle` server SDK. The live workflow uses `Call
 4. Record the default demo flow first, then the authorized live flow.
 5. Blur phone numbers, API keys, and any unplanned personal information from the final video.
 6. Add the public video URL and upstream PR URL to Devpost.
+
+## Roadmap, not MVP scope
+
+The orchestration pattern can later be reused by hospital networks, humanitarian supply chains, and public-health agencies to verify stock exceptions or coordinate human-approved redistribution. The submitted MVP makes only the narrower pharmacy-availability claim demonstrated in the application.
 
 ## Upstream PR checklist
 
