@@ -1,144 +1,208 @@
-const defaultDemoPharmacies = [
-  { name: "Harbor Health Pharmacy", phone: "+12025550123", distanceKm: "2.4" },
-  { name: "Riverside Care Pharmacy", phone: "+12025550124", distanceKm: "5.1" }
-];
+// ============================================================================
+// MedRoute — Client Application Entry Point
+// Imports storage, API, and rendering modules. Manages state and event wiring.
+// ============================================================================
+
+import { dom } from "./js/dom.js";
+import { loadSavedPharmacies, savePharmacies, loadAccessToken, saveAccessToken } from "./js/storage.js";
+import { apiCheck, apiFetchHistory, apiDownloadTranscript } from "./js/api.js";
+import {
+  setLiveCallOverlay,
+  renderPharmacies,
+  showResults,
+  renderHistoryList,
+  changeView as renderingChangeView,
+  updateCtaMode,
+} from "./js/rendering.js";
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+/** @type {import("./js/api.js").Pharmacy[]} Current pharmacy list. */
 let pharmacies = loadSavedPharmacies();
+
+/** @type {import("./js/api.js").CheckRecord[]} Saved check history loaded from the server. */
 let history = [];
-const root = document.querySelector("#pharmacies");
-const accessTokenInput = document.querySelector("#access-token");
-accessTokenInput.value = sessionStorage.getItem("medroute-access-token") || "medroute-demo";
-const authHeaders = () => ({ "Authorization": `Bearer ${accessTokenInput.value.trim()}` });
-const pendingLiveRequestKey = "medroute-pending-live-request";
-accessTokenInput.addEventListener("input", () => sessionStorage.setItem("medroute-access-token", accessTokenInput.value.trim()));
-const esc = value => String(value ?? "").replace(/[&<>"]/g, char => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" })[char]);
-function loadSavedPharmacies() {
-  try {
-    const stored = localStorage.getItem("medroute-authorized-pharmacies");
-    if (stored === null) return defaultDemoPharmacies.map(pharmacy => ({ ...pharmacy }));
-    const saved = JSON.parse(stored);
-    return Array.isArray(saved) ? saved.slice(0, 5).map(pharmacy => ({ name: String(pharmacy.name || ""), phone: String(pharmacy.phone || ""), distanceKm: String(pharmacy.distanceKm || "") })) : [];
-  } catch { return []; }
-}
-function savePharmacies() { localStorage.setItem("medroute-authorized-pharmacies", JSON.stringify(pharmacies)); }
-const callOverlay = document.querySelector("#call-overlay");
-function setLiveCallOverlay(active, pharmacyList = [], medicine = "") {
-  if (!active) {
-    document.body.classList.remove("call-in-progress");
-    callOverlay.hidden = true;
-    callOverlay.querySelector("video").pause();
-    return;
-  }
-  const pharmacyNames = pharmacyList.map(pharmacy => pharmacy.name).filter(Boolean);
-  const destination = pharmacyNames.length === 1 ? pharmacyNames[0] : `${pharmacyNames.length} authorized pharmacies`;
-  callOverlay.querySelector("#call-overlay-title").textContent = `CALL-E is checking ${medicine || "medicine"}`;
-  callOverlay.querySelector("#call-overlay-detail").textContent = `Speaking with ${destination}. This may take a few minutes.`;
-  callOverlay.hidden = false;
-  document.body.classList.add("call-in-progress");
-  const animation = callOverlay.querySelector("video");
-  animation.currentTime = 0;
-  animation.play().catch(() => {});
-  callOverlay.focus();
-}
-document.querySelectorAll(".example-value").forEach(input => input.addEventListener("focus", () => { if (input.classList.contains("example-value")) { input.value = ""; input.classList.remove("example-value"); } }, { once: true }));
 
-function renderPharmacies() {
-  root.innerHTML = pharmacies.length ? pharmacies.map((p, i) => `<div class="pharmacy"><input aria-label="Pharmacy name" placeholder="Pharmacy name" value="${esc(p.name)}"><input aria-label="E.164 phone" placeholder="+12025550123" value="${esc(p.phone)}"><input aria-label="Distance km" type="number" min="0" step="0.1" placeholder="km" value="${esc(p.distanceKm)}"><button aria-label="Remove pharmacy" data-remove="${i}">×</button></div>`).join("") : `<p class="empty-state">No pharmacies added yet. Add only contacts you are authorized to call.</p>`;
+/** @type {string} Current operator access token. */
+let accessToken = loadAccessToken();
+
+// ---------------------------------------------------------------------------
+// Access token persistence
+// ---------------------------------------------------------------------------
+
+dom.accessToken.value = accessToken;
+dom.accessToken.addEventListener("input", () => {
+  accessToken = dom.accessToken.value.trim();
+  saveAccessToken(accessToken);
+});
+
+// ---------------------------------------------------------------------------
+// View switching (delegates to rendering, passes token)
+// ---------------------------------------------------------------------------
+
+/**
+ * Switch between workspace and analytics views.
+ * @param {"workspace"|"analytics"} view - Target view.
+ * @returns {Promise<void>}
+ */
+async function changeView(view) {
+  await renderingChangeView(view, accessToken);
 }
 
-function transcriptLink(record, resultIndex, result) {
-  if (Array.isArray(result.transcript) && result.transcript.length) return `<button type="button" class="transcript-download" data-transcript-url="/api/transcripts/${encodeURIComponent(record.id)}/${resultIndex}.pdf">Download call transcript PDF <span aria-hidden="true">↓</span></button>`;
-  return result.mode === "live" ? `<p class="transcript-status">No transcript was returned for this call.</p>` : "";
+// ---------------------------------------------------------------------------
+// Event handlers — Pharmacy form
+// ---------------------------------------------------------------------------
+
+/**
+ * Sync a pharmacy row's input values back into the pharmacies array.
+ * @param {number} index - Index of the pharmacy in the array.
+ * @param {HTMLElement} row - The .pharmacy DOM row element.
+ * @returns {void}
+ */
+function syncPharmacyFromRow(index, row) {
+  const inputs = row.querySelectorAll("input");
+  pharmacies[index] = {
+    name: inputs[0].value,
+    phone: inputs[1].value,
+    distanceKm: inputs[2].value,
+  };
+  savePharmacies(pharmacies);
 }
 
-function resultCards(record) {
-  return record.results.map((x, i) => { const r = x.result || {}; const pickup = { can_hold: "ready for pickup today", cannot_hold: "not confirmed today", ready_today: "ready for pickup today", not_confirmed_today: "not confirmed today", unknown: "unknown" }[r.pickup_readiness] || String(r.pickup_readiness || "unknown").replaceAll("_", " "); return `<article class="result ${esc(r.stock_status || "unknown")}"><div class="rank">${String(i + 1).padStart(2, "0")}</div><div><h3>${esc(x.pharmacy)}</h3><p>${esc(x.distanceKm)} km away · ${esc(x.phone)}</p></div><strong>${esc((r.stock_status || "unavailable").replaceAll("_", " "))}</strong><dl><div><dt>Price</dt><dd>${esc(r.price_range || "Unknown")}</dd></div><div><dt>Pickup today</dt><dd>${esc(pickup)}</dd></div><div><dt>Hours</dt><dd>${esc(r.hours || "Unknown")}</dd></div></dl><p class="note">${esc(r.notes || x.error || "No details returned.")}</p>${transcriptLink(record, i, x)}</article>`; }).join("");
-}
+dom.pharmacies.addEventListener("input", (e) => {
+  const row = /** @type {HTMLElement} */ (e.target).closest(".pharmacy");
+  if (!row) return;
+  const index = [...dom.pharmacies.children].indexOf(row);
+  syncPharmacyFromRow(index, row);
+});
 
-function show(record, scroll = true) {
-  const output = document.querySelector("#output");
-  output.hidden = false;
-  document.querySelector("#badge").textContent = record.mode === "demo" ? "DEMO RESULTS" : "LIVE RESULTS";
-  document.querySelector("#results").innerHTML = resultCards(record);
-  if (scroll) output.scrollIntoView({ behavior: "smooth" });
-}
+dom.pharmacies.addEventListener("click", (e) => {
+  if (/** @type {HTMLElement} */ (e.target).dataset.remove === undefined) return;
+  pharmacies.splice(Number(/** @type {HTMLElement} */ (e.target).dataset.remove), 1);
+  savePharmacies(pharmacies);
+  renderPharmacies(pharmacies);
+});
 
-async function loadHistory() {
-  const response = await fetch("/api/history", { headers: authHeaders() });
-  if (!response.ok) return;
-  const data = await response.json();
-  history = data.history || [];
-  document.querySelector("#history-count").textContent = `${history.length} saved`;
-  document.querySelector("#history-list").innerHTML = history.length ? history.map(item => `<button class="history-item" data-history-id="${esc(item.id)}"><span><b>${esc(item.medicine)}</b><small>${new Date(item.createdAt).toLocaleString()} · ${esc(item.mode)}</small></span><strong>${item.results.length} call${item.results.length === 1 ? "" : "s"} →</strong></button>`).join("") : `<p class="history-empty">Your completed availability checks will appear here after the first run.</p>`;
-}
-
-function recentTranscriptAction(item) {
-  const transcripts = (item.results || []).map((result, index) => ({ result, index })).filter(({ result }) => Array.isArray(result.transcript) && result.transcript.length);
-  if (transcripts.length === 1) return `<button type="button" class="activity-pdf" data-transcript-url="/api/transcripts/${encodeURIComponent(item.id)}/${transcripts[0].index}.pdf">PDF <span aria-hidden="true">↓</span></button>`;
-  if (transcripts.length > 1) return `<button class="activity-view-pdfs" type="button" data-history-id="${esc(item.id)}">View PDFs</button>`;
-  return "";
-}
-
-const analyticsPreviewLimit = 7;
-function medicineDemandRow(item, maximum) {
-  return `<div class="bar-row"><span>${esc(item.medicine)}</span><div><i style="width:${Math.max(12, item.count / maximum * 100)}%"></i></div><b>${item.count}</b></div>`;
-}
-function recentActivityRow(item) {
-  return `<div class="activity"><span class="activity-dot ${esc(item.mode)}"></span><div><b>${esc(item.medicine)}</b><small>${new Date(item.createdAt).toLocaleString()}</small></div><em>${item.results.length} call${item.results.length === 1 ? "" : "s"}</em>${recentTranscriptAction(item)}</div>`;
-}
-function analyticsOverflow(items, label, renderItem) {
-  const more = items.slice(analyticsPreviewLimit);
-  return more.length ? `<details class="analytics-overflow"><summary>See ${more.length} more ${label}<span aria-hidden="true">⌄</span></summary><div class="analytics-overflow-list">${more.map(renderItem).join("")}</div></details>` : "";
-}
-
-async function loadAnalytics() {
-  const response = await fetch("/api/analytics", { headers: authHeaders() });
-  if (!response.ok) return;
-  const data = await response.json();
-  const maximum = Math.max(...data.topMedicines.map(item => item.count), 1);
-  const medicineRows = data.topMedicines.slice(0, analyticsPreviewLimit).map(item => medicineDemandRow(item, maximum)).join("");
-  const recentRows = data.recent.slice(0, analyticsPreviewLimit).map(recentActivityRow).join("");
-  document.querySelector("#analytics-content").innerHTML = `<div class="metrics"><article><small>Saved checks</small><b>${data.totalRuns}</b><span>On this device</span></article><article><small>Pharmacies reached</small><b>${data.totalCalls}</b><span>Across all checks</span></article><article><small>In-stock rate</small><b>${data.inStockRate}%</b><span>Reported availability</span></article><article><small>Live runs</small><b>${data.liveRuns}</b><span>CALL-E completed</span></article></div><div class="analytics-grid"><section class="chart-card"><div><p class="eyebrow">MOST REQUESTED</p><h2>Medicine demand</h2></div>${data.topMedicines.length ? `${medicineRows}${analyticsOverflow(data.topMedicines, "medicines", item => medicineDemandRow(item, maximum))}` : `<p class="analytics-empty">No saved checks yet. Complete an availability check to start seeing trends.</p>`}</section><section class="chart-card"><div><p class="eyebrow">RECENT ACTIVITY</p><h2>Latest checks</h2></div>${data.recent.length ? `${recentRows}${analyticsOverflow(data.recent, "checks", recentActivityRow)}` : `<p class="analytics-empty">No activity to show yet.</p>`}</section></div>`;
-}
-
-root.addEventListener("input", e => { const row = e.target.closest(".pharmacy"); if (!row) return; const i = [...root.children].indexOf(row); const inputs = row.querySelectorAll("input"); pharmacies[i] = { name: inputs[0].value, phone: inputs[1].value, distanceKm: inputs[2].value }; savePharmacies(); });
-root.addEventListener("click", e => { if (e.target.dataset.remove !== undefined) { pharmacies.splice(Number(e.target.dataset.remove), 1); savePharmacies(); renderPharmacies(); } });
-document.querySelector("#add").onclick = () => { pharmacies.push({ name: "", phone: "", distanceKm: "" }); savePharmacies(); renderPharmacies(); };
-document.querySelector("#live").onchange = event => { document.querySelector("#run").innerHTML = event.target.checked ? "<span>Place authorized live checks</span><b>→</b>" : "<span>Preview availability checks</span><b>→</b>"; };
-document.querySelector("#run").onclick = async () => {
-  const button = document.querySelector("#run"), consent = document.querySelector("#consent");
-  if (!consent.checked) return alert("Please confirm authorization before preparing checks.");
-  if (!accessTokenInput.value.trim()) return alert("Enter the operator access token.");
-  const confirmLive = document.querySelector("#live").checked;
-  const medicine = document.querySelector("#medicine").value;
-  button.disabled = true; button.textContent = confirmLive ? "Live checks in progress…" : "Preparing checks…";
-  const strength = [document.querySelector("#strength-value").value, document.querySelector("#strength-unit").value, document.querySelector("#dosage-form").value].filter(Boolean).join(" ");
-  if (confirmLive) setLiveCallOverlay(true, pharmacies, medicine);
-  const requestBody = { medicine, strength, pharmacies, confirmLive, consentAcknowledged: consent.checked, liveCallAcknowledged: confirmLive };
-  const requestFingerprint = JSON.stringify(requestBody);
-  const savedRequest = confirmLive ? JSON.parse(sessionStorage.getItem(pendingLiveRequestKey) || "null") : null;
-  const idempotencyKey = confirmLive ? (savedRequest?.fingerprint === requestFingerprint ? savedRequest.idempotencyKey : crypto.randomUUID()) : null;
-  if (confirmLive) sessionStorage.setItem(pendingLiveRequestKey, JSON.stringify({ fingerprint: requestFingerprint, idempotencyKey }));
-  try { const response = await fetch("/api/check", { method: "POST", headers: { "Content-Type": "application/json", ...authHeaders(), ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}) }, body: JSON.stringify(requestBody) }); const data = await response.json(); if (!response.ok) throw new Error(response.status === 401 ? "The operator access token is missing or does not match this server. Copy MEDROUTE_ACCESS_TOKEN from your local .env.local file and try again." : data.error); if (confirmLive) sessionStorage.removeItem(pendingLiveRequestKey); show(data); await loadHistory(); } catch (e) { alert(e.message); } finally { if (confirmLive) setLiveCallOverlay(false); button.disabled = false; button.innerHTML = confirmLive ? "<span>Place authorized live checks</span><b>→</b>" : "<span>Preview availability checks</span><b>→</b>"; }
+document.querySelector("#add").onclick = () => {
+  pharmacies.push({ name: "", phone: "", distanceKm: "" });
+  savePharmacies(pharmacies);
+  renderPharmacies(pharmacies);
 };
-document.querySelector("#history-list").onclick = event => { const id = event.target.closest("[data-history-id]")?.dataset.historyId; const record = history.find(item => item.id === id); if (record) show(record, true); };
-document.querySelector("#analytics-content").onclick = async event => { const id = event.target.closest("[data-history-id]")?.dataset.historyId; if (!id) return; const record = history.find(item => item.id === id); if (!record) return; await changeView("workspace"); show(record, true); };
-document.addEventListener("click", async event => {
-  const button = event.target.closest("[data-transcript-url]");
+
+// ---------------------------------------------------------------------------
+// Event handlers — Run check
+// ---------------------------------------------------------------------------
+
+dom.run.onclick = async () => {
+  if (!dom.consent.checked) return alert("Please confirm authorization before preparing checks.");
+  if (!dom.accessToken.value.trim()) return alert("Enter the operator access token.");
+
+  const isLive = dom.live.checked;
+  const medicine = dom.medicine.value;
+  const strength = [dom.strengthValue.value, dom.strengthUnit.value, dom.dosageForm.value]
+    .filter(Boolean)
+    .join(" ");
+
+  dom.run.disabled = true;
+  dom.run.textContent = isLive ? "Live calls in progress…" : "Preparing checks…";
+  if (isLive) setLiveCallOverlay(true, pharmacies, medicine);
+
+  try {
+    /** @type {import("./js/api.js").CheckRequestBody} */
+    const requestBody = {
+      medicine,
+      strength,
+      pharmacies,
+      confirmLive: isLive,
+      consentAcknowledged: dom.consent.checked,
+      liveCallAcknowledged: isLive,
+    };
+    const data = await apiCheck(accessToken, requestBody);
+    showResults(data);
+    history = await apiFetchHistory(accessToken);
+    renderHistoryList(history);
+  } catch (error) {
+    alert(/** @type {Error} */ (error).message);
+  } finally {
+    if (isLive) setLiveCallOverlay(false);
+    dom.run.disabled = false;
+    updateCtaMode();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Event handlers — Navigation
+// ---------------------------------------------------------------------------
+
+dom.live.onchange = updateCtaMode;
+
+document.querySelectorAll(".nav-tab").forEach((button) => {
+  button.onclick = () => changeView(/** @type {string} */ (/** @type {HTMLElement} */ (button).dataset.view));
+});
+
+dom.home.onclick = () => changeView("workspace");
+
+// ---------------------------------------------------------------------------
+// Event handlers — History clicks
+// ---------------------------------------------------------------------------
+
+dom.historyList.onclick = (event) => {
+  const id = /** @type {HTMLElement} */ (event.target.closest("[data-history-id]"))?.dataset.historyId;
+  const record = history.find((item) => item.id === id);
+  if (record) showResults(record, true);
+};
+
+dom.analyticsContent.onclick = async (event) => {
+  const id = /** @type {HTMLElement} */ (event.target.closest("[data-history-id]"))?.dataset.historyId;
+  if (!id) return;
+  const record = history.find((item) => item.id === id);
+  if (!record) return;
+  await changeView("workspace");
+  showResults(record, true);
+};
+
+// ---------------------------------------------------------------------------
+// Event handlers — Transcript downloads
+// ---------------------------------------------------------------------------
+
+document.addEventListener("click", async (event) => {
+  const button = /** @type {HTMLElement} */ (event.target.closest("[data-transcript-url]"));
   if (!button) return;
   button.disabled = true;
   try {
-    const response = await fetch(button.dataset.transcriptUrl, { headers: authHeaders() });
-    if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.error || "Could not download transcript."); }
-    const url = URL.createObjectURL(await response.blob());
-    const link = document.createElement("a");
-    link.href = url; link.download = "medroute-call-transcript.pdf"; link.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1_000);
-  } catch (error) { alert(error.message); }
-  finally { button.disabled = false; }
+    await apiDownloadTranscript(accessToken, /** @type {string} */ (button.dataset.transcriptUrl));
+  } catch (error) {
+    alert(/** @type {Error} */ (error).message);
+  } finally {
+    button.disabled = false;
+  }
 });
-async function changeView(view) { document.querySelector("#workspace").hidden = view !== "workspace"; document.querySelector("#analytics").hidden = view !== "analytics"; document.querySelectorAll(".nav-tab").forEach(tab => tab.classList.toggle("active", tab.dataset.view === view)); if (view === "analytics") await loadAnalytics(); window.scrollTo({ top: 0, behavior: "smooth" }); }
-document.querySelectorAll(".nav-tab").forEach(button => button.onclick = () => changeView(button.dataset.view));
-document.querySelector("#home").onclick = () => changeView("workspace");
 
-renderPharmacies();
-loadHistory();
+// ---------------------------------------------------------------------------
+// Event handlers — Example value placeholders
+// ---------------------------------------------------------------------------
+
+document.querySelectorAll(".example-value").forEach((input) =>
+  input.addEventListener(
+    "focus",
+    () => {
+      if (input.classList.contains("example-value")) {
+        input.value = "";
+        input.classList.remove("example-value");
+      }
+    },
+    { once: true }
+  )
+);
+
+// ---------------------------------------------------------------------------
+// Initialization
+// ---------------------------------------------------------------------------
+
+renderPharmacies(pharmacies);
+apiFetchHistory(accessToken).then((data) => {
+  history = data;
+  renderHistoryList(history);
+});
