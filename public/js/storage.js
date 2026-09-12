@@ -39,7 +39,7 @@ export function loadSavedPharmacies() {
       ? saved.slice(0, 5).map((p) => ({
           name: String(p.name || ""),
           phone: String(p.phone || ""),
-          distanceKm: String(p.distanceKm || ""),
+          distanceKm: String(p.distanceKm ?? ""),
         }))
       : [];
   } catch {
@@ -58,10 +58,10 @@ export function savePharmacies(pharmacies) {
 
 /**
  * Read the saved access token from sessionStorage.
- * @returns {string} The saved token, or "medroute-demo" if none is set.
+ * @returns {string} The saved token, or an empty string if none is set.
  */
 export function loadAccessToken() {
-  return sessionStorage.getItem(TOKEN_STORAGE_KEY) || "medroute-demo";
+  return sessionStorage.getItem(TOKEN_STORAGE_KEY) || "";
 }
 
 /**

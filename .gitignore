@@ -4,4 +4,6 @@ __pycache__/
 .env
 .env.local
 data/
+.deslop/
+tmp/
 .DS_Store

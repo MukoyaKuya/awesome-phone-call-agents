@@ -14,6 +14,7 @@
  * @typedef {Object} CheckRequestBody
  * @property {string} medicine
  * @property {string} strength
+ * @property {{strengthValue: string, strengthUnit: string, form: string, releaseType: string, brand: string, requestedQuantity?: number}} [productRequest]
  * @property {Pharmacy[]} pharmacies
  * @property {boolean} confirmLive
  * @property {boolean} consentAcknowledged
@@ -79,10 +80,11 @@ function authHeaders(token) {
  * Manages idempotency keys for live requests via sessionStorage.
  * @param {string} token - Current access token.
  * @param {CheckRequestBody} requestBody - Check request parameters.
+ * @param {Function} [onProgress] - Receives read-only call phase updates.
  * @returns {Promise<CheckRecord>} The completed check record with results.
  * @throws {Error} If the server returns an error response.
  */
-export async function apiCheck(token, requestBody) {
+export async function apiCheck(token, requestBody, onProgress) {
   const requestFingerprint = JSON.stringify(requestBody);
   const isLive = requestBody.confirmLive;
   const savedRequest = isLive ? JSON.parse(sessionStorage.getItem(pendingLiveRequestKey) || "null") : null;
@@ -94,26 +96,79 @@ export async function apiCheck(token, requestBody) {
     sessionStorage.setItem(pendingLiveRequestKey, JSON.stringify({ fingerprint: requestFingerprint, idempotencyKey }));
   }
 
-  const response = await fetch("/api/check", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...authHeaders(token),
-      ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
-    },
-    body: JSON.stringify(requestBody),
-  });
+  const stopProgress = isLive && onProgress ? observeCheckProgress(token, idempotencyKey, onProgress) : () => {};
+  try {
+    const response = await fetch("/api/check", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeaders(token),
+        ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
+      },
+      body: JSON.stringify(requestBody),
+    });
 
-  const data = await response.json();
-  if (!response.ok) {
-    const message = response.status === 401
-      ? "The operator access token is missing or does not match this server. Copy MEDROUTE_ACCESS_TOKEN from your local .env.local file and try again."
-      : data.error;
-    throw new Error(message);
+    const data = await response.json();
+    if (!response.ok) {
+      const message = response.status === 401
+        ? "The operator access token does not match this server. Live calls require the server's MEDROUTE_ACCESS_TOKEN."
+        : data.error;
+      throw new Error(message);
+    }
+
+    if (isLive) sessionStorage.removeItem(pendingLiveRequestKey);
+    return /** @type {CheckRecord} */ (data);
+  } finally {
+    stopProgress();
   }
+}
 
-  if (isLive) sessionStorage.removeItem(pendingLiveRequestKey);
-  return /** @type {CheckRecord} */ (data);
+/** Observe the existing request without submitting another call.
+ * @param {string} token - Operator credential.
+ * @param {string} key - Idempotency key of the running request.
+ * @param {Function} onProgress - Receives provider phase updates.
+ * @returns {Function} Stops polling and aborts any pending progress read.
+ */
+function observeCheckProgress(token, key, onProgress) {
+  let stopped = false, controller;
+  let timer = setTimeout(poll, 750);
+  /** @returns {Promise<void>} Read a single progress update. */
+  async function poll() {
+    controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(), 5000);
+    try {
+      const response = await fetch("/api/check-progress", { headers: { ...authHeaders(token), "Idempotency-Key": key }, signal: controller.signal });
+      if (response.ok) {
+        const progress = await response.json();
+        if (!stopped) onProgress(progress);
+      }
+    } catch { /* A progress read failure must not retry or cancel the call. */ }
+    finally {
+      clearTimeout(deadline);
+      if (!stopped) timer = setTimeout(poll, 750);
+    }
+  }
+  return () => { stopped = true; clearTimeout(timer); controller?.abort(); };
+}
+
+/**
+ * Read public runtime capabilities so the interface never implies that a
+ * simulated demo can place a telephone call.
+ * @returns {Promise<{safeDemoMode: boolean, liveCallsAvailable: boolean, requiresOperatorToken: boolean}|null>} Runtime capabilities, or null when unavailable.
+ */
+export async function apiFetchRuntimeCapabilities() {
+  try {
+    const response = await fetch("/healthz");
+    if (!response.ok) return null;
+    const data = await response.json();
+    return {
+      safeDemoMode: data.safeDemoMode === true,
+      liveCallsAvailable: data.liveCallsAvailable === true,
+      requiresOperatorToken: data.requiresOperatorToken !== false,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -137,6 +192,23 @@ export async function apiFetchAnalytics(token) {
   const response = await fetch("/api/analytics", { headers: authHeaders(token) });
   if (!response.ok) return null;
   return /** @type {Promise<AnalyticsData>} */ (response.json());
+}
+
+/**
+ * Remove only locally stored demo runs. The endpoint is intentionally absent
+ * in production, where completed runs form part of the audit record.
+ * @param {string} token - Current access token.
+ * @returns {Promise<{deleted: number}>} Number of demo records removed.
+ * @throws {Error} If the reset cannot be completed.
+ */
+export async function apiResetDemoHistory(token) {
+  const response = await fetch("/api/demo/reset", {
+    method: "POST",
+    headers: authHeaders(token),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Could not reset demo history.");
+  return /** @type {{deleted: number}} */ (data);
 }
 
 /**

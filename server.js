@@ -1,10 +1,11 @@
 import { createServer } from "node:http";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { ProductionStore } from "./production-store.js";
 import { actorFromClaims, hasPermission } from "./authorization.js";
+import { offerSchema, sanitizeOffers, quantityUnit } from "./public/js/comparison.js";
 import { extname, join, normalize, relative } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -89,6 +90,7 @@ import { extname, join, normalize, relative } from "node:path";
  * @property {string} fingerprint - Request fingerprint for validation.
  * @property {Promise<CheckRecord>} promise - In-flight promise for the result.
  * @property {boolean} uncertain - Whether the outcome is unknown (needs reconciliation).
+ * @property {number} _settledAt - Timestamp when the promise settled (0 if still pending).
  */
 
 /**
@@ -121,17 +123,21 @@ const transcriptPdfScript = join(process.cwd(), "scripts", "generate-transcript-
 const productionMode = process.env.MEDROUTE_ENV === "production";
 
 /**
- * Operator access token for non-production mode.
- * Falls back to "medroute-demo" when neither CALLE_API_KEY nor MEDROUTE_ACCESS_TOKEN is set.
- * @type {string|undefined}
+ * Read a positive integer configuration value, falling back for invalid input.
+ * @param {string|undefined} value - Environment variable value.
+ * @param {number} fallback - Value to use when the input is invalid.
+ * @returns {number} A positive integer.
  */
-const accessToken =
-  process.env.MEDROUTE_ACCESS_TOKEN ||
-  (!productionMode && !process.env.CALLE_API_KEY ? "medroute-demo" : undefined);
-
-if (!productionMode && process.env.CALLE_API_KEY && !process.env.MEDROUTE_ACCESS_TOKEN) {
-  throw new Error("Live CALL-E configuration requires MEDROUTE_ACCESS_TOKEN.");
+function positiveIntegerSetting(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
+
+/** @type {boolean} Whether this process has no CALL-E credential and can only simulate checks. */
+const safeDemoMode = !productionMode && !process.env.CALLE_API_KEY;
+
+/** @type {string|undefined} Operator access token for non-production API routes. */
+const accessToken = process.env.MEDROUTE_ACCESS_TOKEN;
 
 /** @type {number} Maximum API requests per minute per operator+IP. */
 const maxChecksPerMinute = Number(process.env.MEDROUTE_MAX_CHECKS_PER_MINUTE || 30);
@@ -139,11 +145,37 @@ const maxChecksPerMinute = Number(process.env.MEDROUTE_MAX_CHECKS_PER_MINUTE || 
 /** @type {number} Minimum milliseconds between live calls to the same pharmacy. */
 const liveCooldownMs = Number(process.env.MEDROUTE_LIVE_COOLDOWN_SECONDS || 900) * 1_000;
 
-/** @type {number} Milliseconds before a pending idempotency reservation can be retried. */
-const idempotencyPendingMs = Number(process.env.MEDROUTE_IDEMPOTENCY_PENDING_SECONDS || 900) * 1_000;
+/** @type {number} How long completed in-memory idempotency results remain cached. */
+const idempotencyCacheTtlMs = 30 * 60_000;
 
 /** @type {number} Maximum number of transcript turns to retain from a call. */
 const maxTranscriptTurns = Number(process.env.MEDROUTE_MAX_TRANSCRIPT_TURNS || 200);
+
+/** @type {number} Maximum simultaneous transcript-PDF child processes per server instance. */
+const maxConcurrentPdfJobs = positiveIntegerSetting(process.env.MEDROUTE_MAX_CONCURRENT_PDF_JOBS, 2);
+
+/** @type {number} Maximum permitted transcript-PDF generation time in milliseconds. */
+const pdfGenerationTimeoutMs = positiveIntegerSetting(process.env.MEDROUTE_PDF_TIMEOUT_MS, 30_000);
+
+/** @type {number} Maximum PDF output size in bytes. */
+const maxPdfOutputBytes = positiveIntegerSetting(process.env.MEDROUTE_MAX_PDF_OUTPUT_BYTES, 5_000_000);
+
+/** @type {number} Interval for observing CALL-E result status after a call has been created. */
+const callResultPollMs = positiveIntegerSetting(process.env.MEDROUTE_CALL_RESULT_POLL_MS, 750);
+
+/** @type {number} Maximum time to wait for CALL-E to complete a live call. */
+const callResultTimeoutMs = positiveIntegerSetting(process.env.MEDROUTE_CALL_RESULT_TIMEOUT_MS, 600_000);
+
+/**
+ * A provider can briefly report a terminal state before its outbound attempt
+ * and structured result have been attached. Keep observing that state instead
+ * of persisting an incomplete result immediately.
+ */
+const incompleteCallResultGraceMs = positiveIntegerSetting(process.env.MEDROUTE_CALL_INCOMPLETE_RESULT_GRACE_MS, 120_000);
+const callFinalizationGraceMs = positiveIntegerSetting(process.env.MEDROUTE_CALL_FINALIZATION_GRACE_MS, 15_000);
+
+/** @type {number} Milliseconds between automatic eviction sweeps of in-memory maps. */
+const evictionIntervalMs = Number(process.env.MEDROUTE_EVICTION_INTERVAL_MS || 300_000);
 
 /** @type {string} OIDC permission required to read history and transcripts. */
 const readPermission = process.env.MEDROUTE_OIDC_READ_PERMISSION || "medroute.read";
@@ -151,8 +183,8 @@ const readPermission = process.env.MEDROUTE_OIDC_READ_PERMISSION || "medroute.re
 /** @type {string} OIDC permission required to place live calls. */
 const livePermission = process.env.MEDROUTE_OIDC_LIVE_PERMISSION || "medroute.live";
 
-if (productionMode && (!process.env.DATABASE_URL || !process.env.MEDROUTE_OIDC_ISSUER || !process.env.MEDROUTE_OIDC_AUDIENCE || !process.env.MEDROUTE_OIDC_JWKS_URL)) {
-  throw new Error("Production mode requires DATABASE_URL and MEDROUTE_OIDC_ISSUER, MEDROUTE_OIDC_AUDIENCE, and MEDROUTE_OIDC_JWKS_URL.");
+if (productionMode && (!process.env.DATABASE_URL || !process.env.MEDROUTE_OIDC_ISSUER || !process.env.MEDROUTE_OIDC_AUDIENCE || !process.env.MEDROUTE_OIDC_JWKS_URL || !process.env.MEDROUTE_RECIPIENT_HASH_KEY || process.env.MEDROUTE_RECIPIENT_HASH_KEY.length < 32)) {
+  throw new Error("Production mode requires DATABASE_URL, OIDC configuration, and a MEDROUTE_RECIPIENT_HASH_KEY of at least 32 characters.");
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +228,39 @@ const localCooldownReservations = new Map();
 /** Serialised save queue for atomic local history writes. */
 let saveQueue = Promise.resolve();
 
+/** @type {number} Number of transcript-PDF child processes currently running. */
+let activePdfJobs = 0;
+
+// ---------------------------------------------------------------------------
+// Periodic eviction of stale in-memory state
+// ---------------------------------------------------------------------------
+
+/**
+ * Remove stale entries from in-memory maps to prevent unbounded growth.
+ * Evicts: expired rate-limit windows, expired idempotent runs, and expired cooldown reservations.
+ * @returns {void}
+ */
+function evictStaleMaps() {
+  const now = Date.now();
+  for (const [key, window] of requestWindows) {
+    const fresh = window.filter((t) => now - t < 60_000);
+    if (fresh.length === 0) requestWindows.delete(key);
+    else requestWindows.set(key, fresh);
+  }
+  for (const [key, entry] of idempotentRuns) {
+    if (entry.uncertain) continue;
+    if (entry._settledAt && now - entry._settledAt > idempotencyCacheTtlMs) {
+      idempotentRuns.delete(key);
+    }
+  }
+  for (const [key, calledAt] of localCooldownReservations) {
+    if (now - calledAt > liveCooldownMs) localCooldownReservations.delete(key);
+  }
+}
+
+/** @type {ReturnType<typeof setInterval> | null} Periodic eviction timer handle. */
+let evictionTimer = null;
+
 // ---------------------------------------------------------------------------
 // CALL-E result schema
 // ---------------------------------------------------------------------------
@@ -206,15 +271,17 @@ let saveQueue = Promise.resolve();
  */
 const resultSchema = {
   type: "object",
-  required: ["stock_status", "price_range", "pickup_readiness", "hours", "confidence"],
+  required: ["stock_status", "price_range", "pickup_readiness", "hours", "substitution_available", "notes", "confidence"],
+  additionalProperties: false,
   properties: {
-    stock_status: { type: "string", enum: ["in_stock", "limited", "out_of_stock", "unknown"] },
-    price_range: { type: "string" },
-    pickup_readiness: { type: "string", enum: ["ready_today", "not_confirmed_today", "unknown"] },
-    hours: { type: "string" },
-    substitution_available: { type: "string" },
-    notes: { type: "string" },
-    confidence: { type: "string", enum: ["high", "medium", "low"] },
+    offers: offerSchema,
+    stock_status: { type: "string", enum: ["in_stock", "limited", "out_of_stock", "unknown"], description: "Confirmed availability of the exact requested medicine and strength. Use unknown when it was not confirmed." },
+    price_range: { type: "string", description: "Confirmed approximate price or price range. Use 'Unknown' if not confirmed after clarification." },
+    pickup_readiness: { type: "string", enum: ["ready_today", "not_confirmed_today", "unknown"], description: "Whether pickup today without a reservation was confirmed." },
+    hours: { type: "string", description: "Confirmed closing time for today. Use 'Unknown' if not confirmed after clarification." },
+    substitution_available: { type: "string", description: "Only what staff reported about the same medicine in another strength or form; use 'Not applicable' when the requested medicine is available." },
+    notes: { type: "string", description: "Brief factual recap of answers, explicitly noting any item that remained unknown." },
+    confidence: { type: "string", enum: ["high", "medium", "low"], description: "High only when every core answer was confirmed in the final recap; medium or low when any item was unknown or uncertain." },
   },
 };
 
@@ -237,6 +304,14 @@ function json(res, status, value) {
     "Referrer-Policy": "no-referrer",
   });
   res.end(JSON.stringify(value));
+}
+
+/**
+ * Generate a short, unique request ID for correlation logging.
+ * @returns {string} Request ID string.
+ */
+function generateRequestId() {
+  return `req_${Math.random().toString(16).slice(2, 10)}`;
 }
 
 /**
@@ -313,11 +388,12 @@ function phoneKey(phone) {
  * @param {{medicine: string, strength: string, pharmacies: Pharmacy[]}} params - Request parameters.
  * @returns {string} Hex-encoded SHA-256 fingerprint.
  */
-function requestFingerprint({ medicine, strength, pharmacies }) {
+function requestFingerprint({ medicine, strength, pharmacies, productRequest }) {
   return createHash("sha256")
     .update(JSON.stringify({
       medicine,
       strength,
+      ...(productRequest ? { productRequest } : {}),
       pharmacies: pharmacies.map((p) => ({ name: p.name, phone: phoneKey(p.phone), distanceKm: p.distanceKm })),
     }))
     .digest("hex");
@@ -336,6 +412,7 @@ function sanitizeResult(result) {
 
   return {
     stock_status: ["in_stock", "limited", "out_of_stock", "unknown"].includes(source.stock_status) ? source.stock_status : "unknown",
+    offers: sanitizeOffers(source.offers, redactPhoneNumbers),
     price_range: redactPhoneNumbers(source.price_range),
     pickup_readiness: ["ready_today", "not_confirmed_today", "unknown"].includes(pickupReadiness) ? pickupReadiness : "unknown",
     hours: redactPhoneNumbers(source.hours),
@@ -352,8 +429,8 @@ function sanitizeResult(result) {
  * @returns {Object} Public-safe record for client consumption.
  */
 function publicRecord(record) {
-  const { idempotencyKey, requestFingerprint, results = [], ...rest } = record;
-  return { ...rest, results: results.map(({ recipientKey, ...result }) => result) };
+  const { idempotencyKey: _idempotencyKey, requestFingerprint: _requestFingerprint, results = [], ...rest } = record;
+  return { ...rest, results: results.map(({ recipientKey: _recipientKey, ...result }) => result) };
 }
 
 // ---------------------------------------------------------------------------
@@ -383,13 +460,14 @@ async function authenticate(req) {
     }
   }
 
-  const expected = `Bearer ${accessToken || ""}`;
-  return Boolean(accessToken) &&
-    typeof supplied === "string" &&
-    supplied.length === expected.length &&
-    timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))
-    ? { subject: createHash("sha256").update("local\0local-operator").digest("hex"), permissions: new Set([readPermission, livePermission]) }
-    : null;
+  // Local mode deliberately has one friction-free operator flow. When a
+  // CALL-E key is configured it can place a consented live test call; without
+  // that key it can only produce simulated results. Public deployments must
+  // use production OIDC authentication below.
+  return {
+    subject: createHash("sha256").update(safeDemoMode ? "local\0safe-demo" : "local\0open-operator").digest("hex"),
+    permissions: new Set([readPermission, livePermission]),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -423,8 +501,9 @@ function withinRateLimit(req, actor) {
  * @param {Pharmacy} pharmacy - Pharmacy to generate a demo result for.
  * @param {string} medicine - Medicine name being checked.
  * @returns {CallResult} Demo call result with mode "demo".
+ * @param {Object} productRequest - Structured product specifications, when supplied.
  */
-function demoResult(pharmacy, medicine) {
+function demoResult(pharmacy, medicine, productRequest) {
   const seeds = ["in_stock", "limited", "out_of_stock"];
   const status = seeds[Number(pharmacy.phone.at(-1)) % seeds.length];
   return {
@@ -432,6 +511,18 @@ function demoResult(pharmacy, medicine) {
     phone: maskPhone(pharmacy.phone),
     distanceKm: pharmacy.distanceKm,
     result: {
+      offers: productRequest ? [{
+        medicine, brand: productRequest.brand || (Number(pharmacy.phone.at(-1)) % 2 ? "Example Brand A" : "Example Brand B"),
+        strength: `${productRequest.strengthValue} ${productRequest.strengthUnit}`, form: productRequest.form,
+        releaseType: productRequest.releaseType, exactMatch: true, stock_status: status,
+        pickup_readiness: status === "in_stock" ? "ready_today" : "not_confirmed_today",
+        price: Number(pharmacy.phone.at(-1)) % 2 ? 600 : 900,
+        quantity: Number(pharmacy.phone.at(-1)) % 2 ? 30 : 60,
+        purchaseMode: "whole_pack",
+        availableQuantity: status === "out_of_stock" ? 0 : status === "limited" ? 60 : 180,
+        unit: ({ Tablet: "tablet", Capsule: "capsule", Syrup: "mL", Suspension: "mL", Cream: "g" })[productRequest.form] || "unknown",
+        currency: "KES", priceType: "exact", quote: "Fictional demo pack price; not a real pharmacy quote.",
+      }] : [],
       stock_status: status,
       price_range: status === "out_of_stock" ? "Not available" : "KES 2,400–3,100",
       pickup_readiness: status === "in_stock" ? "ready_today" : "not_confirmed_today",
@@ -458,7 +549,7 @@ function score(item) {
   const r = item.result || {};
   const stockScore = r.stock_status === "in_stock" ? 100 : r.stock_status === "limited" ? 55 : 0;
   const pickupBonus = ["ready_today", "can_hold"].includes(r.pickup_readiness) ? 20 : 0;
-  const distancePenalty = Number(item.distanceKm || 0) * 2;
+  const distancePenalty = item.distanceKm == null ? 1 : item.distanceKm / (1 + item.distanceKm);
   return stockScore + pickupBonus - distancePenalty;
 }
 
@@ -494,7 +585,7 @@ async function readHistory(actor) {
 async function saveHistory(record, actor) {
   if (productionStore) return productionStore.saveRun(record, actor);
   const save = async () => {
-    const history = await readHistory();
+    const history = await readHistory(actor);
     history.unshift(record);
     await mkdir(dataDir, { recursive: true });
     const temporaryFile = `${historyFile}.${process.pid}.tmp`;
@@ -502,6 +593,28 @@ async function saveHistory(record, actor) {
     await rename(temporaryFile, historyFile);
   };
   const pending = saveQueue.then(save, save);
+  saveQueue = pending.catch(() => {});
+  return pending;
+}
+
+/**
+ * Remove completed demo records from local development history atomically.
+ * Live-call records are deliberately retained, and production history cannot
+ * be reset through this development-only workflow.
+ * @returns {Promise<number>} Number of demo records removed.
+ */
+async function resetDemoHistory() {
+  const reset = async () => {
+    const history = await readHistory();
+    const retained = history.filter((record) => record.mode !== "demo");
+    const removed = history.length - retained.length;
+    await mkdir(dataDir, { recursive: true });
+    const temporaryFile = `${historyFile}.${process.pid}.tmp`;
+    await writeFile(temporaryFile, JSON.stringify(retained.slice(0, 100), null, 2), "utf8");
+    await rename(temporaryFile, historyFile);
+    return removed;
+  };
+  const pending = saveQueue.then(reset, reset);
   saveQueue = pending.catch(() => {});
   return pending;
 }
@@ -622,6 +735,11 @@ function cleanTranscript(call) {
  * @throws {Error} If the Python script fails or returns an empty file.
  */
 function createTranscriptPdf(payload) {
+  if (activePdfJobs >= maxConcurrentPdfJobs) {
+    return Promise.reject(new Error("Transcript generation is busy. Please retry shortly."));
+  }
+
+  activePdfJobs += 1;
   return new Promise((resolve, reject) => {
     const python = process.env.MEDROUTE_PYTHON || "python";
     const child = spawn(python, [transcriptPdfScript], {
@@ -630,16 +748,41 @@ function createTranscriptPdf(payload) {
     });
     const output = [];
     const errors = [];
-    child.stdout.on("data", (chunk) => output.push(chunk));
+    let outputBytes = 0;
+    let settled = false;
+    const finish = (error, pdf = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      activePdfJobs -= 1;
+      if (error) reject(error);
+      else resolve(pdf);
+    };
+    const timeout = setTimeout(() => {
+      child.kill();
+      finish(new Error("Could not create transcript PDF: generator timed out."));
+    }, pdfGenerationTimeoutMs);
+    timeout.unref();
+
+    child.stdout.on("data", (chunk) => {
+      outputBytes += chunk.length;
+      if (outputBytes > maxPdfOutputBytes) {
+        child.kill();
+        finish(new Error("Could not create transcript PDF: generator output exceeds the allowed size."));
+        return;
+      }
+      output.push(chunk);
+    });
     child.stderr.on("data", (chunk) => errors.push(chunk));
-    child.once("error", (error) => reject(new Error(`Could not create transcript PDF: ${error.message}`)));
+    child.stdin.once("error", (error) => finish(new Error(`Could not create transcript PDF: ${error.message}`)));
+    child.once("error", (error) => finish(new Error(`Could not create transcript PDF: ${error.message}`)));
     child.once("close", (code) => {
       if (code !== 0) {
-        return reject(new Error(`Could not create transcript PDF: ${Buffer.concat(errors).toString("utf8").trim() || "PDF generator failed."}`));
+        return finish(new Error(`Could not create transcript PDF: ${Buffer.concat(errors).toString("utf8").trim() || "PDF generator failed."}`));
       }
       const pdf = Buffer.concat(output);
-      if (!pdf.length) return reject(new Error("Could not create transcript PDF: generator returned an empty file."));
-      resolve(pdf);
+      if (!pdf.length) return finish(new Error("Could not create transcript PDF: generator returned an empty file."));
+      finish(null, pdf);
     });
     child.stdin.end(JSON.stringify(payload));
   });
@@ -652,33 +795,107 @@ function createTranscriptPdf(payload) {
 /**
  * Build the task prompt for a CALL-E pharmacy availability call.
  * The prompt instructs the agent to identify itself, confirm the pharmacy,
- * and ask structured questions about stock, price, pickup, and hours.
+ * collect each required fact one at a time, and verify a final recap.
  * @param {Pharmacy} pharmacy - Target pharmacy.
  * @param {string} medicine - Medicine name.
  * @param {string} strength - Strength and dosage form.
  * @returns {string} Full task prompt for the CALL-E agent.
+ * @param {Object} productRequest - Structured product specifications, when supplied.
  */
-function buildCallTask(pharmacy, medicine, strength) {
+function buildCallTask(pharmacy, medicine, strength, productRequest) {
   const medicineRequest = `${medicine}${strength ? `, ${strength}` : ""}`;
-  return `You are an automated MedRoute medicine-availability representative calling ${pharmacy.name}.
+  return `Call ${pharmacy.name} for a medicine availability check.
 
-CRITICAL OPENING: Your first spoken words must be exactly: "Hello, this is an AI representative from Med Route. Is this ${pharmacy.name}?" Speak the full pharmacy name exactly as written. Stop immediately after this question and wait for the response. Do not ask about medicine before the pharmacy is confirmed.
+Start with: "Hello, this is an AI representative from Med Route. Is this ${pharmacy.name}?" Wait for the answer. If they do not confirm the pharmacy after one clarification, politely end the call without discussing medicine.
 
-IDENTITY CHECK:
-- If they clearly confirm this is ${pharmacy.name}, continue.
-- If the answer is unclear, ask exactly once: "May I confirm, is this ${pharmacy.name}?" Then wait.
-- If they do not confirm after that, say "Thank you. I may have reached the wrong number. Goodbye." and end the call. Do not ask any availability questions.
+After confirmation, explain that you are checking availability for a care coordinator. Ask about ${medicineRequest}.
+${productRequest ? `Requested product details: ${JSON.stringify(productRequest)}.
+Collect up to three brand offers for the exact requested medicine, strength, dosage form and release type. If a preferred brand is given, ask about it first. Confirm the active ingredient or exact requested medicine name, brand, strength, form and release type with staff; never infer equivalence between brands. Set exactMatch true only after explicit confirmation of every product detail.
+For each offer ask for total pack price, currency, pack quantity and the unit covered by that price (tablets, capsules, mL or g), stock and pickup readiness. Ask what quantity the quoted price buys; do not assume a standard pack size. Record approximate prices as approximate and retain ranges only in quote text and omit the numeric price. Omit unknown numeric fields (price, quantity and availableQuantity); never invent numbers or use zero for unknown. Preserve the original quote. Do not calculate unit prices. Return these details in offers; return an empty offers array if none were confirmed. Different strengths, forms or release types are not matching offers.` : ""}
+${productRequest?.requestedQuantity ? `The caregiver wants to purchase ${productRequest.requestedQuantity} ${quantityUnit(productRequest.form)}. This is a purchase quantity, not a dose. Confirm how many units are available for purchase. Record availableQuantity in the same units as the quote, never as a pack count. Ask whether whole packs are required and whether the quoted price applies to each pack needed; only then set purchaseMode to whole_pack. Set per_unit only if staff explicitly confirms they can sell the requested quantity at the same proportional unit price. Otherwise use unknown. Do not infer purchase terms or sufficient stock from a general in-stock response. Include these confirmations in the original quote. Do not order or reserve anything.` : "For structured offers, leave purchaseMode unknown and omit availableQuantity unless staff explicitly confirms purchase terms and units available."}
 
-AFTER CONFIRMATION: Say exactly: "On behalf of a care coordinator, we're requesting a time-sensitive medicine availability check." Then ask: "Is ${medicineRequest} available today?"
+Ask one question at a time and collect:
+1. Whether the exact medicine and strength is available today.
+2. Its approximate price or price range.
+3. Whether it can be picked up today without a reservation or hold.
+4. Today's closing time.
+5. Only if unavailable, whether the same medicine exists in another strength or form.
 
-QUESTION RULES:
-1. Listen completely to each answer before speaking again.
-2. Never ask the same question twice. If an answer is unclear, refused, or unknown, record that item as unknown and move on; do not rephrase it.
-3. Extract every fact volunteered in an answer. Do not ask for a fact that the pharmacy has already supplied.
-4. Only when still missing, ask each of these once and in this order: approximate price range; whether it is available for pickup today (do not ask the pharmacy to reserve or hold it); today's closing time.
-5. Once those four items are answered or marked unknown, say "Thank you for your help. Goodbye." and end the call. Do not restart the conversation or repeat the medicine name.
+Accept clear answers and do not repeat answered questions. If an answer is unclear, clarify it briefly once, then record it as unknown and continue. At the end, clearly introduce the recap by saying, "Here is a brief summary of what I heard:" before listing the answers. Then ask, "Is that summary correct?", thank the staff member, and end the call.
 
-SAFETY: Identify yourself as an automated assistant. Do not share patient information, request prescriptions, make a purchase, place an order, reserve medicine, give medical advice, or infer facts the pharmacy did not state. Return only facts stated by ${pharmacy.name}.`;
+Identify yourself as AI. Do not disclose patient information, request a prescription, order or reserve anything, give medical advice, or invent facts. Return only information stated by the pharmacy.`;
+}
+
+/**
+ * Pause without tying the provider-result logic to a particular SDK helper.
+ * @param {number} milliseconds - Delay duration.
+ * @returns {Promise<void>} Resolves after the requested delay.
+ */
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+/**
+ * Determine whether a provider snapshot includes an attempt that has clearly
+ * finished. A failed attempt with a completion time is safe to report as a
+ * genuine failure; a task-level failure with no completed attempt is not.
+ * @param {Object} call - CALL-E call response object.
+ * @returns {boolean} Whether at least one attempt has conclusively finished.
+ */
+function hasCompletedAttempt(call) {
+  const attempts = (call.recipients || []).map(recipient => recipient.attempts?.at(-1)).filter(Boolean);
+  return attempts.length > 0 && attempts.every(attempt => ["completed", "failed", "canceled"].includes(attempt.status) && Boolean(attempt.completedAt));
+}
+
+/**
+ * Wait for a usable CALL-E snapshot. CALL-E's convenience waiter ends at the
+ * first task-level terminal state, which can occur before an outbound attempt
+ * or its structured result becomes visible. This waiter only accepts a
+ * terminal incomplete snapshot after a completed failed attempt or a grace
+ * period, preserving the later real call result when it arrives.
+ * @param {Object} client - Initialized CALL-E client.
+ * @param {string} callId - CALL-E call identifier.
+ * @param {Function} onProgress - Reports connecting, calling, or finalizing.
+ * @returns {Promise<Object>} The most recent usable or conclusively final call snapshot.
+ */
+async function waitForCallResult(client, callId, onProgress) {
+  const deadline = Date.now() + callResultTimeoutMs;
+  let incompleteTerminalSince = 0;
+  let latestCall = null;
+  let finishedAttemptSince = 0;
+
+  while (Date.now() <= deadline) {
+    const call = await client.calls.get(callId);
+    latestCall = call;
+    const recipient = call.recipients?.[0];
+    const structuredResult = recipient?.structuredResult ?? call.structuredResult;
+    const finished = hasCompletedAttempt(call) || (call.status === "completed" && Boolean(call.completedAt) && !recipient?.attempts?.length);
+    onProgress(finished || structuredResult ? "finalizing" : recipient?.attempts?.length ? "calling" : "connecting");
+    if (structuredResult) return call;
+
+    // The telephone conversation can finish before the task-level status or
+    // extraction result. Bound that processing wait independently of dialing.
+    if (finished) {
+      finishedAttemptSince ||= Date.now();
+      const failed = ["failed", "canceled"].includes(recipient?.attempts?.at(-1)?.status);
+      if (failed || Date.now() - finishedAttemptSince >= callFinalizationGraceMs) return call;
+    } else {
+      finishedAttemptSince = 0;
+    }
+
+    const terminal = ["completed", "failed", "canceled"].includes(call.status);
+    if (!terminal) {
+      incompleteTerminalSince = 0;
+    } else if (!finished) {
+      incompleteTerminalSince ||= Date.now();
+      if (Date.now() - incompleteTerminalSince >= incompleteCallResultGraceMs) return call;
+    }
+
+    await wait(callResultPollMs);
+  }
+
+  if (latestCall) return latestCall;
+  throw new Error("CALL-E did not return a call status before the configured timeout.");
 }
 
 /**
@@ -687,40 +904,112 @@ SAFETY: Identify yourself as an automated assistant. Do not share patient inform
  * @param {Pharmacy} pharmacy - Pharmacy to call.
  * @param {string} medicine - Medicine name.
  * @param {string} strength - Strength and dosage form.
+ * @param {string} providerIdempotencyKey - Stable CALL-E key reused by safe create retries.
+ * @param {Object} productRequest - Structured product specifications, when supplied.
+ * @param {Function} onProgress - Reports provider call progress.
  * @returns {Promise<CallResult>} Sanitized call result with transcript.
  * @throws {Error} If the call fails or returns no structured result.
  */
-async function runLiveCall(pharmacy, medicine, strength) {
+async function runLiveCall(pharmacy, medicine, strength, providerIdempotencyKey, productRequest, onProgress) {
   const { CalleClient } = await import(process.env.MEDROUTE_CALLE_CLIENT_MODULE || "@call-e/calle");
-  const client = new CalleClient({ apiKey: process.env.CALLE_API_KEY });
+  const client = new CalleClient({ apiKey: process.env.CALLE_API_KEY, fetch: request => request.method === "GET"
+    ? fetch(request, { signal: AbortSignal.timeout(20_000) }) : fetch(request) });
 
   const outboundRecipient = { phone: pharmacy.phone };
-  if (process.env.MEDROUTE_CALL_LOCALE) outboundRecipient.locale = process.env.MEDROUTE_CALL_LOCALE;
-  if (process.env.MEDROUTE_CALL_REGION) outboundRecipient.region = process.env.MEDROUTE_CALL_REGION;
+  // Kenya is a supported international CALL-E destination. Supplying the
+  // routing hints avoids an ambiguous plan when the recipient is a Kenyan
+  // number, while other destinations continue to use provider inference (or
+  // explicit deployment-level overrides).
+  const isKenyanNumber = pharmacy.phone.startsWith("+254");
+  outboundRecipient.locale = process.env.MEDROUTE_CALL_LOCALE || (isKenyanNumber ? "en-KE" : undefined);
+  outboundRecipient.region = process.env.MEDROUTE_CALL_REGION || (isKenyanNumber ? "KE" : undefined);
+  if (outboundRecipient.locale === undefined) delete outboundRecipient.locale;
+  if (outboundRecipient.region === undefined) delete outboundRecipient.region;
 
-  const call = await client.calls.createAndWait({
-    task: buildCallTask(pharmacy, medicine, strength),
-    recipient: outboundRecipient,
-    resultSchema,
+  const createInput = {
+    task: buildCallTask(pharmacy, medicine, strength, productRequest),
+    // Use the documented plural recipient format even for one pharmacy.
+    recipients: [outboundRecipient],
+    // One provider task per pharmacy: only recipient extraction is needed.
     recipientResultSchema: resultSchema,
     metadata: { workflow: "medroute-pharmacy-availability" },
-  });
-
-  const recipient = call.recipients[0];
-  const result = recipient?.structuredResult ?? call.structuredResult;
-  if (!result) throw new Error("CALL-E completed without a structured pharmacy result.");
-
-  return {
-    pharmacy: pharmacy.name,
-    phone: maskPhone(pharmacy.phone),
-    recipientKey: phoneKey(pharmacy.phone),
-    distanceKm: pharmacy.distanceKm,
-    result: sanitizeResult(result),
-    callId: safeText(call.id, 120),
-    summary: redactPhoneNumbers(recipient?.summary ?? call.summary ?? ""),
-    transcript: cleanTranscript(call),
-    mode: "live",
   };
+
+  let createdCall;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      createdCall = await client.calls.create(createInput, { idempotencyKey: providerIdempotencyKey });
+      break;
+    } catch (error) {
+      const code = safeText(error?.code, 80);
+      const message = safeText(error?.message, 220).toLowerCase();
+      const retryable = ["internal_error", "provider_unavailable", "call_not_ready"].includes(code)
+        || message.includes("call plan could not be prepared")
+        || message.includes("provider unavailable");
+      if (!retryable || attempt === 2) throw error;
+      await wait(500 * (2 ** attempt));
+    }
+  }
+
+  if (!createdCall?.id) throw new Error("CALL-E accepted no call identifier.");
+  try {
+    const call = await waitForCallResult(client, createdCall.id, onProgress);
+
+    const recipient = call.recipients?.[0];
+    const result = recipient?.structuredResult ?? call.structuredResult;
+    if (!result) {
+      const lastAttempt = recipient?.attempts?.at(-1);
+      const detail = redactPhoneNumbers(safeText(
+        lastAttempt?.failureMessage || recipient?.summary || call.failureMessage || call.summary || "CALL-E did not return a structured result.",
+        220
+      ));
+      return {
+        pharmacy: pharmacy.name,
+        phone: maskPhone(pharmacy.phone),
+        recipientKey: phoneKey(pharmacy.phone),
+        distanceKm: pharmacy.distanceKm,
+        result: {
+          stock_status: "unknown",
+          price_range: "Unknown",
+          pickup_readiness: "unknown",
+          hours: "Unknown",
+          substitution_available: "Unknown",
+          notes: detail,
+          confidence: "low",
+        },
+        callId: safeText(call.id, 120),
+        summary: redactPhoneNumbers(recipient?.summary ?? call.summary ?? ""),
+        transcript: cleanTranscript(call),
+        mode: "live",
+        error: `The call did not produce a complete result: ${detail}`,
+      };
+    }
+
+    return {
+      pharmacy: pharmacy.name,
+      phone: maskPhone(pharmacy.phone),
+      recipientKey: phoneKey(pharmacy.phone),
+      distanceKm: pharmacy.distanceKm,
+      result: sanitizeResult(result),
+      callId: safeText(call.id, 120),
+      summary: redactPhoneNumbers(recipient?.summary ?? call.summary ?? ""),
+      transcript: cleanTranscript(call),
+      mode: "live",
+    };
+  } catch (error) {
+    // Creation succeeded: observation or normalization failures cannot prove
+    // that the recipient was never contacted. Persist the provider reference
+    // so retries keep the same result and the recipient cooldown stays active.
+    return {
+      pharmacy: pharmacy.name,
+      phone: maskPhone(pharmacy.phone),
+      recipientKey: phoneKey(pharmacy.phone),
+      distanceKm: pharmacy.distanceKm,
+      callId: safeText(createdCall.id, 120),
+      mode: "live",
+      error: `The call was created, but its outcome could not be confirmed. Check the provider call record before retrying: ${redactPhoneNumbers(safeText(error?.message, 220))}`,
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -740,8 +1029,30 @@ async function runLiveCall(pharmacy, medicine, strength) {
  * @returns {ValidationError|ValidationSuccess} Validation result.
  */
 function validateCheckRequest(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { error: "The request body must be a JSON object." };
+  }
+  if (Array.isArray(body.pharmacies) && body.pharmacies.some((p) => !p || typeof p !== "object" || Array.isArray(p))) {
+    return { error: "Every pharmacy must be a JSON object." };
+  }
   const medicine = safeText(body.medicine);
   const strength = safeText(body.strength, 60);
+  let productRequest;
+  if (body.productRequest !== undefined) {
+    const p = body.productRequest;
+    if (!p || typeof p !== "object" || Array.isArray(p)) return { error: "Product details must be an object." };
+    productRequest = Object.fromEntries(["strengthValue", "strengthUnit", "form", "releaseType", "brand"].map(key => [key, safeText(p[key], 80)]));
+    if (!Number.isFinite(Number(productRequest.strengthValue)) || Number(productRequest.strengthValue) <= 0 || !productRequest.strengthUnit || !productRequest.form || !["standard", "extended", "delayed"].includes(productRequest.releaseType)) {
+      return { error: "Provide strength, unit, form and release type to compare offers." };
+    }
+    if (p.requestedQuantity !== undefined) {
+      const unit = quantityUnit(productRequest.form);
+      if (typeof p.requestedQuantity !== "number" || !Number.isFinite(p.requestedQuantity) || p.requestedQuantity <= 0 || p.requestedQuantity > 1_000_000 || !unit || (["tablet", "capsule"].includes(unit) && !Number.isInteger(p.requestedQuantity))) {
+        return { error: "Requested quantity must be positive and at most 1,000,000; use whole tablets/capsules or mL/g for supported forms." };
+      }
+      productRequest.requestedQuantity = p.requestedQuantity;
+    }
+  }
   const pharmacies = Array.isArray(body.pharmacies) ? body.pharmacies.slice(0, 5) : [];
 
   if (!medicine || pharmacies.length === 0) {
@@ -751,14 +1062,17 @@ function validateCheckRequest(body) {
   const clean = pharmacies.map((p) => ({
     name: safeText(p.name),
     phone: safeText(p.phone, 24),
-    distanceKm: p.distanceKm === "" || p.distanceKm == null ? 0 : Number(p.distanceKm),
+    distanceKm: p.distanceKm === "" || p.distanceKm == null ? null : Number(p.distanceKm),
   }));
 
   if (clean.some((p) => !p.name || !/^\+[1-9]\d{7,14}$/.test(p.phone))) {
     return { error: "Every pharmacy must have a name and an authorized phone number in international E.164 format, such as +12025550123." };
   }
-  if (clean.some((p) => !Number.isFinite(p.distanceKm) || p.distanceKm < 0)) {
+  if (clean.some((p) => p.distanceKm !== null && (!Number.isFinite(p.distanceKm) || p.distanceKm < 0))) {
     return { error: "Pharmacy distance must be a non-negative number." };
+  }
+  if (new Set(clean.map((p) => p.phone)).size !== clean.length) {
+    return { error: "Each pharmacy must have a distinct authorized phone number." };
   }
   if (body.consentAcknowledged !== true) {
     return { error: "Confirm authorization to contact every pharmacy before running a check." };
@@ -769,7 +1083,7 @@ function validateCheckRequest(body) {
     return { error: "Explicit live-call authorization is required." };
   }
 
-  return { medicine, strength, pharmacies: clean, liveRequested };
+  return { medicine, strength: productRequest ? `${productRequest.strengthValue} ${productRequest.strengthUnit} ${productRequest.form}` : strength, productRequest, pharmacies: clean, liveRequested };
 }
 
 // ---------------------------------------------------------------------------
@@ -803,6 +1117,24 @@ async function handleGetAnalytics(req, res, actor) {
     json(res, 200, computeAnalytics(await readHistory(actor.subject)));
   } catch (error) {
     json(res, 500, { error: error.message || "Could not read analytics." });
+  }
+}
+
+/**
+ * Handle POST /api/demo/reset — delete only local development demo history.
+ * This endpoint is unavailable in production to prevent accidental removal
+ * of operational audit data.
+ * @param {import("node:http").IncomingMessage} req - HTTP request.
+ * @param {import("node:http").ServerResponse} res - HTTP response.
+ * @returns {Promise<void>}
+ */
+async function handlePostDemoReset(req, res) {
+  if (productionMode) return json(res, 404, { error: "Not found" });
+  try {
+    const deleted = await resetDemoHistory();
+    json(res, 200, { deleted });
+  } catch (error) {
+    json(res, 500, { error: error.message || "Could not reset demo history." });
   }
 }
 
@@ -871,20 +1203,24 @@ async function handlePostCheck(req, res, actor) {
   const validation = validateCheckRequest(body);
   if (validation.error) return json(res, 400, { error: validation.error });
 
-  const { medicine, strength, pharmacies: clean, liveRequested } = validation;
+  const { medicine, strength, productRequest, pharmacies: clean, liveRequested } = validation;
 
   if (productionMode && liveRequested && !hasPermission(actor, livePermission)) {
     return json(res, 403, { error: `The ${livePermission} permission is required for live calls.` });
   }
 
-  const live = Boolean(process.env.CALLE_API_KEY && liveRequested);
+  if (liveRequested && !process.env.CALLE_API_KEY) {
+    return json(res, 503, { error: "Live calling is unavailable on this server. Configure CALL-E credentials and start the calling server, or explicitly choose a demo preview. No call was placed." });
+  }
+  const live = liveRequested;
+  const progress = { phases: clean.map(() => "connecting") };
   const idempotencyKey = safeText(req.headers["idempotency-key"], 120);
 
   if (live && !/^[A-Za-z0-9_-]{16,120}$/.test(idempotencyKey)) {
     return json(res, 400, { error: "A stable Idempotency-Key header is required for live calls." });
   }
 
-  const fingerprint = requestFingerprint({ medicine, strength, pharmacies: clean });
+  const fingerprint = requestFingerprint({ medicine, strength, productRequest, pharmacies: clean });
   const idempotencyMapKey = `${actor.subject}:${idempotencyKey}`;
   const storedIdempotencyKey = productionStore
     ? createHash("sha256").update(idempotencyMapKey).digest("hex")
@@ -906,14 +1242,27 @@ async function handlePostCheck(req, res, actor) {
     if (live) sideEffectsStarted = true;
 
     const calls = live
-      ? await Promise.allSettled(clean.map((p) => runLiveCall(p, medicine, strength)))
-      : clean.map((p) => ({ status: "fulfilled", value: demoResult(p, medicine) }));
+      ? await Promise.allSettled(clean.map((p, index) => {
+          const providerIdempotencyKey = `medroute_${createHash("sha256")
+            .update(`${storedIdempotencyKey}:${fingerprint}:${index}:${phoneKey(p.phone)}`)
+            .digest("hex")}`;
+          return runLiveCall(p, medicine, strength, providerIdempotencyKey, productRequest, phase => { progress.phases[index] = phase; })
+            .finally(() => { progress.phases[index] = "finished"; });
+        }))
+      : clean.map((p) => ({ status: "fulfilled", value: demoResult(p, medicine, productRequest) }));
 
     const results = calls
       .map((item, index) =>
         item.status === "fulfilled"
           ? item.value
-          : { pharmacy: clean[index].name, phone: maskPhone(clean[index].phone), recipientKey: phoneKey(clean[index].phone), distanceKm: clean[index].distanceKm, error: "Call could not be completed.", mode: /** @type {"live"} */ ("live") }
+          : {
+              pharmacy: clean[index].name,
+              phone: maskPhone(clean[index].phone),
+              recipientKey: phoneKey(clean[index].phone),
+              distanceKm: clean[index].distanceKm,
+              error: `CALL-E could not complete this call: ${redactPhoneNumbers(safeText(/** @type {Error} */ (item.reason)?.message || "No provider detail was returned.", 220))}`,
+              mode: /** @type {"live"} */ ("live"),
+            }
       )
       .sort((a, b) => score(b) - score(a));
 
@@ -924,10 +1273,23 @@ async function handlePostCheck(req, res, actor) {
       medicine,
       strength,
       results,
+      schemaVersion: 2,
+      ...(productRequest ? { productRequest } : {}),
       ...(live ? { idempotencyKey: storedIdempotencyKey, requestFingerprint: fingerprint } : {}),
     };
 
     await saveHistory(record, actor.subject);
+
+    // A plan-creation failure has no call id and never contacted the pharmacy,
+    // so it must not consume that recipient's live-call cooldown.
+    if (live) {
+      const notContactedKeys = results.filter((result) => !result.callId).map((result) => result.recipientKey).filter(Boolean);
+      if (productionStore && cooldownReservedAt) {
+        await productionStore.releaseCooldowns?.(notContactedKeys, cooldownReservedAt);
+      } else {
+        for (const key of notContactedKeys) localCooldownReservations.delete(key);
+      }
+    }
 
     if (productionStore) {
       try {
@@ -946,17 +1308,21 @@ async function handlePostCheck(req, res, actor) {
   // Live path: idempotent, async execution with cooldown protection
   /** @type {boolean} Tracks whether side effects (CALL-E calls) have started. */
   let sideEffectsStarted = false;
+  /** @type {Date|null} Timestamp attached to the current cooldown reservation. */
+  let cooldownReservedAt = null;
+  let ownsIdempotencyReservation = false;
 
   const pending = Promise.resolve().then(async () => {
     // Reserve idempotency
     if (productionStore) {
-      const reservation = await productionStore.reserveIdempotency(storedIdempotencyKey, fingerprint, new Date(Date.now() - idempotencyPendingMs));
+      const reservation = await productionStore.reserveIdempotency(storedIdempotencyKey, fingerprint);
       if (!reservation.created) {
         if (reservation.fingerprint !== fingerprint) throw Object.assign(new Error("This Idempotency-Key belongs to a different request."), { status: 409 });
         if (reservation.record) return /** @type {CheckRecord} */ (reservation.record);
         if (reservation.status === "unknown") throw Object.assign(new Error("This live request has an unknown outcome and requires administrator reconciliation before it can be retried."), { status: 409 });
         throw Object.assign(new Error("This live request is already in progress. Retry with the same key shortly."), { status: 409 });
       }
+      ownsIdempotencyReservation = true;
     } else {
       const history = await readHistory(actor.subject);
       const previous = history.find((run) => run.idempotencyKey === idempotencyKey);
@@ -973,12 +1339,13 @@ async function handlePostCheck(req, res, actor) {
     let cooldownReserved;
 
     if (productionStore) {
-      cooldownReserved = await productionStore.reserveCooldowns(recipientKeys, cutoff, new Date());
+      cooldownReservedAt = new Date();
+      cooldownReserved = await productionStore.reserveCooldowns(recipientKeys, cutoff, cooldownReservedAt);
     } else {
       const recentlyCalled = new Set(
         (await readHistory(actor.subject))
           .filter((run) => run.mode === "live" && Date.parse(run.createdAt) >= cutoff)
-          .flatMap((run) => run.results || [])
+          .flatMap((run) => (run.results || []).filter((item) => item.callId))
           .map((item) => item.recipientKey)
           .filter(Boolean)
       );
@@ -986,7 +1353,10 @@ async function handlePostCheck(req, res, actor) {
         if (calledAt < cutoff) localCooldownReservations.delete(key);
       }
       cooldownReserved = !recipientKeys.some((key) => recentlyCalled.has(key) || localCooldownReservations.has(key));
-      if (cooldownReserved) for (const key of recipientKeys) localCooldownReservations.set(key, Date.now());
+      if (cooldownReserved) {
+        cooldownReservedAt = new Date();
+        for (const key of recipientKeys) localCooldownReservations.set(key, cooldownReservedAt.getTime());
+      }
     }
 
     if (!cooldownReserved) {
@@ -997,7 +1367,8 @@ async function handlePostCheck(req, res, actor) {
   });
 
   /** @type {IdempotentRun} */
-  const idempotencyEntry = { fingerprint, promise: pending, uncertain: false };
+  const idempotencyEntry = { fingerprint, promise: pending, progress, uncertain: false, _settledAt: 0 };
+  pending.then(() => {}, () => {}).finally(() => { idempotencyEntry._settledAt = Date.now(); });
   idempotentRuns.set(idempotencyMapKey, idempotencyEntry);
 
   try {
@@ -1017,7 +1388,7 @@ async function handlePostCheck(req, res, actor) {
     }
 
     idempotentRuns.delete(idempotencyMapKey);
-    if (productionStore) await productionStore.releaseIdempotency(storedIdempotencyKey);
+    if (productionStore && ownsIdempotencyReservation) await productionStore.releaseIdempotency(storedIdempotencyKey);
     await productionStore?.audit(actor.subject, "live_check_failed", { status: error.status || 500 });
     return json(res, error.status || 500, { error: error.message || "Unexpected server error" });
   }
@@ -1071,7 +1442,13 @@ async function serveStaticFile(req, res) {
 /** @type {RegExp} Pattern for matching transcript PDF download routes. */
 const transcriptRoutePattern = /^\/api\/transcripts\/(run_[A-Za-z0-9_-]{1,120})\/(\d+)\.pdf$/;
 
-const server = createServer(async (req, res) => {
+/**
+ * Handle a request; the server boundary catches asynchronous failures.
+ * @param {import("node:http").IncomingMessage} req - Incoming request.
+ * @param {import("node:http").ServerResponse} res - Outgoing response.
+ * @returns {Promise<void>} Resolves when the request is handled.
+ */
+async function handleRequest(req, res) {
   // Global security headers
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "no-referrer");
@@ -1082,13 +1459,31 @@ const server = createServer(async (req, res) => {
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
   );
 
+  // Request ID for correlation logging
+  const requestId = req.headers["x-request-id"] || generateRequestId();
+  res.setHeader("X-Request-Id", requestId);
+
   const url = req.url || "";
   const basePath = url.split("?")[0];
+
+  // Health check (no auth required)
+  if (req.method === "GET" && basePath === "/healthz") {
+    return json(res, 200, {
+      status: "ok",
+      mode: productionMode ? "production" : "development",
+      safeDemoMode,
+      liveCallsAvailable: Boolean(process.env.CALLE_API_KEY),
+      requiresOperatorToken: productionMode,
+      uptime: process.uptime(),
+    });
+  }
 
   // API routes require authentication
   if (basePath.startsWith("/api/")) {
     const actor = await authenticate(req);
-    if (!actor) return json(res, 401, { error: "Operator authentication is required." });
+    if (!actor) {
+      return json(res, 401, { error: "Operator authentication is required." });
+    }
 
     // Production-mode permission checks for read/transcript endpoints
     const isReadRequest = req.method === "GET" && ["/api/history", "/api/analytics"].includes(basePath);
@@ -1099,9 +1494,18 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "GET" && basePath === "/api/history") return handleGetHistory(req, res, actor);
     if (req.method === "GET" && basePath === "/api/analytics") return handleGetAnalytics(req, res, actor);
+    if (req.method === "GET" && basePath === "/api/check-progress") {
+      if (productionMode && !hasPermission(actor, readPermission) && !hasPermission(actor, livePermission)) return json(res, 403, { error: "Read or live-call permission is required." });
+      const key = safeText(req.headers["idempotency-key"], 120);
+      const entry = idempotentRuns.get(`${actor.subject}:${key}`);
+      if (!entry?.progress) return json(res, 404, { error: "Progress is not available on this server." });
+      return json(res, 200, entry.progress);
+    }
 
     const transcriptMatch = basePath.match(transcriptRoutePattern);
     if (req.method === "GET" && transcriptMatch) return handleGetTranscript(req, res, actor, transcriptMatch);
+
+    if (req.method === "POST" && basePath === "/api/demo/reset") return handlePostDemoReset(req, res);
 
     if (req.method === "POST" && basePath === "/api/check") return handlePostCheck(req, res, actor);
 
@@ -1109,7 +1513,79 @@ const server = createServer(async (req, res) => {
   }
 
   // Static file serving
-  serveStaticFile(req, res);
+  return serveStaticFile(req, res);
+}
+
+const server = createServer((req, res) => {
+  handleRequest(req, res).catch((error) => {
+    console.error("MedRoute request failed:", error.message);
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    json(res, 500, { error: "Unexpected server error." });
+  });
 });
 
-server.listen(port, () => console.log(`MedRoute running at http://localhost:${port}`));
+// ---------------------------------------------------------------------------
+// Graceful shutdown (production only — test runner manages child processes)
+// ---------------------------------------------------------------------------
+
+/** @type {boolean} Whether the server is shutting down. */
+let shuttingDown = false;
+
+/**
+ * Handle shutdown signals: stop accepting new connections, drain in-flight requests,
+ * clear timers, and exit cleanly.
+ * @param {string} signal - The signal that triggered shutdown.
+ * @returns {void}
+ */
+function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n${signal} received. Shutting down gracefully...`);
+
+  if (evictionTimer) clearInterval(evictionTimer);
+
+  server.close(() => {
+    console.log("All connections drained. Exiting.");
+    process.exit(0);
+  });
+
+  // Force exit after 10 seconds if connections don't drain
+  setTimeout(() => {
+    console.error("Forced shutdown after timeout.");
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+if (productionMode) {
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+}
+
+// ---------------------------------------------------------------------------
+// Start server
+// ---------------------------------------------------------------------------
+
+server.once("error", (error) => {
+  if (error.code === "EADDRINUSE") {
+    console.error(
+      `Cannot start MedRoute: port ${port} is already in use. ` +
+        `Stop the existing server or run with a different port, for example: $env:PORT=${port + 1}; npm start`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  throw error;
+});
+
+server.listen(port, () => {
+  console.log(`MedRoute running at http://localhost:${port}`);
+  // Start periodic eviction of stale in-memory state
+  if (evictionIntervalMs > 0) {
+    evictionTimer = setInterval(evictStaleMaps, evictionIntervalMs);
+    if (evictionTimer.unref) evictionTimer.unref();
+  }
+});

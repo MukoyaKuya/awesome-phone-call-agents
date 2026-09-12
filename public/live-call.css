@@ -81,6 +81,8 @@ body.call-in-progress {
   line-height: 1.45;
 }
 
+#dismiss-call-overlay { display: block; margin: 0 auto 12px; }
+
 @keyframes overlay-in {
   from { opacity: 0; }
   to { opacity: 1; }

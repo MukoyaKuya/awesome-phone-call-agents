@@ -3,6 +3,10 @@ export class ProductionStore {
   async init() {}
   async readHistory(actor) { return this.runs.filter(run => run.actor === actor).map(run => run.record); }
   async reserveIdempotency(key, fingerprint) {
+    if (key === process.env.MEDROUTE_TEST_PENDING_KEY && !this.seededPending) {
+      this.seededPending = true;
+      this.idempotency.set(key, { fingerprint, status: "pending", record: null });
+    }
     const existing = this.idempotency.get(key);
     if (existing) return { created: false, ...existing };
     this.idempotency.set(key, { fingerprint, status: "pending", record: null });

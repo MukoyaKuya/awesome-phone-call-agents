@@ -1,4 +1,12 @@
+/**
+ * PostgreSQL-backed store for MedRoute production mode.
+ * Manages runs, idempotency reservations, pharmacy cooldowns, and audit events.
+ */
 export class ProductionStore {
+  /**
+   * @param {string} connectionString - PostgreSQL connection string.
+   * @param {Object|null} [pool=null] - Optional pre-created pg Pool.
+   */
   constructor(connectionString, pool = null) { this.connectionString = connectionString; this.pool = pool; }
 
   async init() {
@@ -21,18 +29,13 @@ export class ProductionStore {
     return rows.map(row => row.payload);
   }
 
-  async reserveIdempotency(key, fingerprint, staleBefore) {
+  async reserveIdempotency(key, fingerprint) {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
       const inserted = await client.query("INSERT INTO medroute_idempotency (key, fingerprint, status) VALUES ($1, $2, 'pending') ON CONFLICT DO NOTHING RETURNING key", [key, fingerprint]);
       if (inserted.rowCount) { await client.query("COMMIT"); return { created: true }; }
       const { rows } = await client.query("SELECT i.fingerprint, i.status, i.created_at, r.payload FROM medroute_idempotency i LEFT JOIN medroute_runs r ON r.id = i.record_id WHERE i.key = $1 FOR UPDATE OF i", [key]);
-      if (rows[0].status === "pending" && rows[0].created_at < staleBefore) {
-        await client.query("UPDATE medroute_idempotency SET fingerprint = $2, status = 'pending', record_id = NULL, created_at = now() WHERE key = $1", [key, fingerprint]);
-        await client.query("COMMIT");
-        return { created: true };
-      }
       await client.query("COMMIT");
       return { created: false, fingerprint: rows[0].fingerprint, status: rows[0].status, record: rows[0].payload || null };
     } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
@@ -48,7 +51,7 @@ export class ProductionStore {
       await client.query("BEGIN");
       await client.query("INSERT INTO medroute_runs (id, created_at, payload, actor) VALUES ($1, $2, $3, $4)", [record.id, record.createdAt, record, actor]);
       if (record.idempotencyKey) await client.query("UPDATE medroute_idempotency SET status = 'complete', record_id = $2 WHERE key = $1", [record.idempotencyKey, record.id]);
-      for (const result of record.results || []) if (result.recipientKey) await client.query("INSERT INTO medroute_recipient_cooldowns (recipient_key, called_at) VALUES ($1, $2) ON CONFLICT (recipient_key) DO UPDATE SET called_at = EXCLUDED.called_at", [result.recipientKey, record.createdAt]);
+      for (const result of record.results || []) if (result.recipientKey && result.callId) await client.query("INSERT INTO medroute_recipient_cooldowns (recipient_key, called_at) VALUES ($1, $2) ON CONFLICT (recipient_key) DO UPDATE SET called_at = EXCLUDED.called_at", [result.recipientKey, record.createdAt]);
       await client.query("COMMIT");
     } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
   }
@@ -64,6 +67,11 @@ export class ProductionStore {
       await client.query("COMMIT");
       return true;
     } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
+
+  async releaseCooldowns(recipientKeys, reservedAt) {
+    if (!recipientKeys.length) return;
+    await this.pool.query("DELETE FROM medroute_recipient_cooldowns WHERE recipient_key = ANY($1) AND called_at = $2", [recipientKeys, reservedAt]);
   }
 
   async audit(actor, action, metadata = {}) { await this.pool.query("INSERT INTO medroute_audit_events (actor, action, metadata) VALUES ($1, $2, $3)", [actor, action, metadata]); }

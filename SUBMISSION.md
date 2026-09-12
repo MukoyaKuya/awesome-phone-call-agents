@@ -16,7 +16,7 @@ MedRoute lets an operator enter a medicine and a small list of pharmacies they a
 
 The design is deliberately bounded. It never enters patient details, offers medical advice, asks for a prescription, makes a purchase, or holds medication. Demo mode returns deterministic data and never places calls; a second, clearly labelled confirmation is required before the server-side CALL-E code path can run.
 
-Built with the official `@call-e/calle` server SDK. The live workflow uses `CalleClient.calls.createAndWait()` with an explicit recipient, `recipientResultSchema`, metadata, and structured-result handling.
+Built with the official `@call-e/calle` server SDK. The live workflow creates a call with an explicit recipient, `recipientResultSchema`, and metadata, then observes CALL-E until the outbound attempt, transcript, and structured result are available. This prevents an early incomplete provider status from being recorded as the final call outcome.
 
 ## What is novel
 
@@ -31,7 +31,7 @@ Built with the official `@call-e/calle` server SDK. The live workflow uses `Call
 | --- | --- |
 | Real-world impact | Removes a repeated coordination burden when a caregiver or care team needs a particular medicine promptly. |
 | Quality of idea | A focused, bounded calling workflow rather than a generic voice agent. |
-| Technical implementation | Official CALL-E SDK, real `createAndWait` integration, explicit recipients, JSON result schema, metadata, and automated demo smoke test. |
+| Technical implementation | Official CALL-E SDK, real runtime call creation, explicit recipients, JSON result schema, reliable result observation, transcripts, and automated smoke tests. |
 | Product and demo | A polished result-ranked interface, visible safeguards, deterministic demo mode, and a live-call path for authorized recipients. |
 
 ## Video run of show (target: 2:45)
@@ -53,7 +53,7 @@ Built with the official `@call-e/calle` server SDK. The live workflow uses `Call
 3. Set `CALLE_API_KEY` only in your local `.env` or deployment secret store.
 4. Record the default demo flow first, then the authorized live flow.
 5. Blur phone numbers, API keys, and any unplanned personal information from the final video.
-6. Add the public video URL and upstream PR URL to Devpost.
+6. Deploy the safe demo from the included Dockerfile and add its public URL, public video URL, and upstream PR URL to Devpost.
 
 ## Roadmap, not MVP scope
 
