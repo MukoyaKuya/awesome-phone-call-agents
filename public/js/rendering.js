@@ -162,7 +162,11 @@ function transcriptLink(record, resultIndex, result) {
   if (Array.isArray(result.transcript) && result.transcript.length) {
     return `<button type="button" class="transcript-download" data-transcript-url="/api/transcripts/${encodeURIComponent(record.id)}/${resultIndex}.pdf">Download call transcript PDF <span aria-hidden="true">↓</span></button>`;
   }
-  return result.mode === "live" ? `<p class="transcript-status">No transcript was returned for this call.</p>` : "";
+  if (result.mode !== "live") return "";
+  const status = result.callId
+    ? "No transcript was returned for this call."
+    : "No transcript is available because CALL-E did not create a call.";
+  return `<p class="transcript-status">${status}</p>`;
 }
 
 /** Identify a telephone-network response that never reached pharmacy staff.
@@ -190,7 +194,7 @@ function resultCard(result, index, record) {
 
   if (result.error) {
     const status = /(?:result_schema|recipient_result_schema).*not supported/i.test(result.error) && !result.callId ? "Call setup rejected" : result.callId ? "Call incomplete" : "Call not confirmed";
-    return `<article class="call-failure"><h3>${esc(result.pharmacy)}</h3><p>${esc(result.phone)} · ${result.distanceKm == null ? "Distance unknown" : `${esc(result.distanceKm)} km away`}</p><strong>${status}</strong><p>${esc(result.error)}</p><p>No verified availability or price was returned.</p>${result.callId ? `<small>CALL-E reference: ${esc(result.callId)}</small>` : ""}${Array.isArray(result.transcript) && result.transcript.length ? transcriptLink(record, index, result) : ""}</article>`;
+    return `<article class="call-failure"><h3>${esc(result.pharmacy)}</h3><p>${esc(result.phone)} · ${result.distanceKm == null ? "Distance unknown" : `${esc(result.distanceKm)} km away`}</p><strong>${status}</strong><p>${esc(result.error)}</p><p>No verified availability or price was returned.</p>${result.callId ? `<small>CALL-E reference: ${esc(result.callId)}</small>` : ""}${transcriptLink(record, index, result)}</article>`;
   }
 
   if (recipientUnreachable(result)) {

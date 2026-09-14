@@ -17,6 +17,9 @@ export class CalleClient {
     if (!recipient || !recipientResultSchema) {
       throw new Error("Live calls must include a recipient result schema");
     }
+    if (recipient.locale === "en-KE" && recipient.region === "KE") {
+      throw new Error("Live calls must not apply the unsupported Kenya-English routing default");
+    }
     assertCalleSchema(recipientResultSchema);
     if (!/^medroute_[a-f0-9]{64}$/.test(options.idempotencyKey || "")) {
       throw new Error("Live calls must pass a stable provider idempotency key");

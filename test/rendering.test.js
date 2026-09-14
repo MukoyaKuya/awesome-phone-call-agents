@@ -188,7 +188,8 @@ test("one rejected call shows one status card, no empty comparison sections or a
   assert.equal(el("badge").textContent, "CALL FAILED");
   assert.match(html, /Call setup rejected/);
   assert.equal((html.match(/<article/g) || []).length, 1);
-  assert.doesNotMatch(html, /<table|Your decision summary|Nearest available|<dl>|unavailable|No transcript/);
+  assert.doesNotMatch(html, /<table|Your decision summary|Nearest available|<dl>|unavailable/);
+  assert.match(html, /No transcript is available because CALL-E did not create a call/);
 });
 
 test("an automated unreachable message is shown as a delivered call that did not reach staff", () => {
@@ -317,7 +318,7 @@ test("showResults shows 'no transcript' for live calls without transcript", () =
   showResults({
     id: "run_notx", mode: "live", medicine: "Z", strength: "",
     results: [
-      { pharmacy: "NoTxRx", phone: "+1", distanceKm: 1, result: { stock_status: "unknown", price_range: "?", pickup_readiness: "unknown", hours: "?", notes: "", confidence: "low" }, mode: "live" },
+      { pharmacy: "NoTxRx", phone: "+1", distanceKm: 1, callId: "call_without_transcript", result: { stock_status: "unknown", price_range: "?", pickup_readiness: "unknown", hours: "?", notes: "", confidence: "low" }, mode: "live" },
     ],
   }, false);
   assert.match(el("results").innerHTML, /No transcript was returned/);

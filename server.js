@@ -922,16 +922,14 @@ async function runLiveCall(pharmacy, medicine, strength, providerIdempotencyKey,
   const client = new CalleClient({ apiKey: process.env.CALLE_API_KEY, fetch: request => request.method === "GET"
     ? fetch(request, { signal: AbortSignal.timeout(20_000) }) : fetch(request) });
 
-  const outboundRecipient = { phone: pharmacy.phone };
-  // Kenya is a supported international CALL-E destination. Supplying the
-  // routing hints avoids an ambiguous plan when the recipient is a Kenyan
-  // number, while other destinations continue to use provider inference (or
-  // explicit deployment-level overrides).
-  const isKenyanNumber = pharmacy.phone.startsWith("+254");
-  outboundRecipient.locale = process.env.MEDROUTE_CALL_LOCALE || (isKenyanNumber ? "en-KE" : undefined);
-  outboundRecipient.region = process.env.MEDROUTE_CALL_REGION || (isKenyanNumber ? "KE" : undefined);
-  if (outboundRecipient.locale === undefined) delete outboundRecipient.locale;
-  if (outboundRecipient.region === undefined) delete outboundRecipient.region;
+  // Let CALL-E infer a recipient's route from its E.164 number by default.
+  // Deployments can supply verified provider-supported routing hints when
+  // necessary, but never assume a locale or region from a country code.
+  const outboundRecipient = {
+    phone: pharmacy.phone,
+    ...(process.env.MEDROUTE_CALL_LOCALE ? { locale: process.env.MEDROUTE_CALL_LOCALE } : {}),
+    ...(process.env.MEDROUTE_CALL_REGION ? { region: process.env.MEDROUTE_CALL_REGION } : {}),
+  };
 
   const createInput = {
     task: buildCallTask(pharmacy, medicine, strength, productRequest),
@@ -1248,15 +1246,25 @@ async function handlePostCheck(req, res, actor) {
   const execute = async () => {
     if (live) sideEffectsStarted = true;
 
-    const calls = live
-      ? await Promise.allSettled(clean.map((p, index) => {
-          const providerIdempotencyKey = `medroute_${createHash("sha256")
-            .update(`${storedIdempotencyKey}:${fingerprint}:${index}:${phoneKey(p.phone)}`)
-            .digest("hex")}`;
-          return runLiveCall(p, medicine, strength, providerIdempotencyKey, productRequest, phase => { progress.phases[index] = phase; })
-            .finally(() => { progress.phases[index] = "finished"; });
-        }))
-      : clean.map((p, index) => ({ status: "fulfilled", value: demoResult(p, medicine, index, productRequest) }));
+    const calls = [];
+    for (const [index, pharmacy] of clean.entries()) {
+      if (!live) {
+        calls.push({ status: "fulfilled", value: demoResult(pharmacy, medicine, index, productRequest) });
+        continue;
+      }
+
+      const providerIdempotencyKey = `medroute_${createHash("sha256")
+        .update(`${storedIdempotencyKey}:${fingerprint}:${index}:${phoneKey(pharmacy.phone)}`)
+        .digest("hex")}`;
+      try {
+        const result = await runLiveCall(pharmacy, medicine, strength, providerIdempotencyKey, productRequest, phase => { progress.phases[index] = phase; });
+        calls.push({ status: "fulfilled", value: result });
+      } catch (error) {
+        calls.push({ status: "rejected", reason: error });
+      } finally {
+        progress.phases[index] = "finished";
+      }
+    }
 
     const results = calls
       .map((item, index) =>
